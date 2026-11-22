@@ -1,0 +1,80 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+#
+# Every secret or deployment-specific value uses `sync: false`: Render asks for it in the
+# dashboard when the Blueprint is first created, and it is never stored in git.
+#
+# STORYFLOW_CREDENTIALS_KEY must be the SAME value on both services: the web service encrypts
+# users' API keys / Drive tokens with it and the worker decrypts them. Generate it once with
+#   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+# and paste that value into both. Changing it later makes stored credentials unreadable.
+#
+# SUPABASE_SERVICE_ROLE_KEY bypasses Row Level Security. It is configured on the worker ONLY;
+# never add it to the web service or to any NEXT_PUBLIC_* variable.
+services:
+  - type: web
+    name: storyflow-ai
+    runtime: node
+    plan: starter
+    # --include=dev: Tailwind and TypeScript are build-time dependencies.
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22.12.0"
+      - key: NEXT_TELEMETRY_DISABLED
+        value: "1"
+      # Set these in the Render dashboard (sync: false keeps them out of git).
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+      - key: NEXT_PUBLIC_SITE_URL
+        sync: false
+      # Secret: encrypts BYOK provider keys and Drive tokens. Must match the worker's value.
+      - key: STORYFLOW_CREDENTIALS_KEY
+        sync: false
+      # Optional: lets AI Video Studio list the engine's voices (server-side GET /api/voices,
+      # cached for an hour). Same private HTTPS URL and gateway token as the worker; neither
+      # is ever sent to the browser. Leave unset to fall back to a free-text voice ID.
+      - key: AUTOMATED_VIDEO_GENERATOR_URL
+        sync: false
+      - key: VIDEO_ENGINE_TOKEN
+        sync: false
+      # Optional Google Drive integration (add in the dashboard to enable):
+      #   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI
+
+  # Persistent background worker: claims queued video jobs and drives the render pipeline.
+  # Background workers receive no inbound traffic, so there is no health check path.
+  - type: worker
+    name: storyflow-video-worker
+    runtime: node
+    plan: starter
+    # The worker runs plain Node (no Next.js build); production dependencies are enough.
+    buildCommand: npm ci
+    startCommand: npm run worker
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22.12.0"
+      # Same Supabase project URL as the web service.
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      # Secret, worker-only: bypasses RLS to claim jobs, update progress, read encrypted
+      # credentials and upload to the private storyflow-videos bucket.
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Secret: must be identical to the web service's STORYFLOW_CREDENTIALS_KEY.
+      - key: STORYFLOW_CREDENTIALS_KEY
+        sync: false
+      # Private video engine endpoints and the gateway token (see docs/VIDEO_PLATFORM.md).
+      - key: AUTOMATED_VIDEO_GENERATOR_URL
+        sync: false
+      - key: AGENTIC_VIDEO_URL
+        sync: false
+      - key: VIDEO_ENGINE_TOKEN
+        sync: false
+      # Optional (add in the dashboard): GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to upload
+      # finished videos to users' Drive; AGENTIC_VIDEO_SHARED_ROOT (requires a shared disk) for
+      # the analyze.video quality check; GEMINI_IMAGE_MODEL / CLAUDE_MODEL to override defaults.
