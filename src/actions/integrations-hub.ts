@@ -4,8 +4,8 @@ import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 import { getWorkspaceContext } from "@/lib/workspace";
 import { encryptSecret, decryptSecret } from "@/lib/video/crypto";
-import { getProvider, isKeyProvider, isLlmProvider, PROVIDERS } from "@/lib/integrations/catalog";
-import { MAX_AI_PROVIDERS, MODEL_PATTERN } from "@/lib/integrations/plan";
+import { getProvider, isKeyProvider, PROVIDERS } from "@/lib/integrations/catalog";
+import { MAX_AI_PROVIDERS, validateGenerationSettings } from "@/lib/integrations/plan";
 import { testProviderConnection, type TestResult } from "@/lib/integrations/testers";
 import type { ActionState } from "@/lib/types";
 
@@ -29,7 +29,7 @@ export async function saveProviderKeyAction(_: ActionState, formData: FormData):
     { workspace_id: ctx.current.workspace.id, user_id: ctx.user.id, provider, ...encryptSecret(secret) },
     { onConflict: "workspace_id,user_id,provider" },
   );
-  if (error) return { error: "Could not save the key. Please try again." };
+  if (error) return { error: `Could not save the key: ${error.message}` };
   refresh();
   return { success: `${getProvider(provider)?.name} key saved and encrypted.` };
 }
@@ -46,7 +46,7 @@ export async function removeProviderKeyAction(_: ActionState, formData: FormData
     .eq("workspace_id", ctx.current.workspace.id)
     .eq("user_id", ctx.user.id)
     .eq("provider", provider);
-  if (error) return { error: "Could not remove the key." };
+  if (error) return { error: `Could not remove the key: ${error.message}` };
   refresh();
   return { success: "Key removed." };
 }
@@ -59,13 +59,14 @@ export async function testProviderAction(provider: string): Promise<TestResult> 
   let key: string | null = null;
   if (def.auth === "api_key") {
     const supabase = await createClient();
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from("workspace_provider_credentials")
       .select("ciphertext,nonce,auth_tag")
       .eq("workspace_id", ctx.current.workspace.id)
       .eq("user_id", ctx.user.id)
       .eq("provider", provider)
       .maybeSingle();
+    if (error) return { ok: false, message: `Could not read the saved key: ${error.message}` };
     if (!data) return { ok: false, message: "Save an API key first." };
     try {
       key = decryptSecret(data);
@@ -87,7 +88,7 @@ export async function setProviderEnabledAction(_: ActionState, formData: FormDat
   const { error } = await supabase
     .from("workspace_integrations")
     .upsert({ workspace_id: ctx.current.workspace.id, provider, enabled, updated_by: ctx.user.id }, { onConflict: "workspace_id,provider" });
-  if (error) return { error: "Could not update the provider." };
+  if (error) return { error: `Could not update the provider: ${error.message}` };
   refresh();
   return { success: enabled ? "Enabled for this workspace." : "Disabled for this workspace." };
 }
@@ -98,32 +99,33 @@ export async function saveGenerationSettingsAction(_: ActionState, formData: For
   if (!ctx.canManage) return { error: "Only owners and admins can change generation settings." };
 
   const freeMode = formData.get("freeMode") === "true";
-  const order: string[] = [];
-  for (let i = 0; i < MAX_AI_PROVIDERS; i++) {
-    const id = String(formData.get(`provider_${i}`) ?? "");
-    if (!id) continue;
-    if (!isLlmProvider(id)) return { error: "Choose valid AI providers." };
-    if (!order.includes(id)) order.push(id);
-  }
-  if (order.length === 0) return { fieldErrors: { provider_0: "Choose at least one AI provider." } };
-
+  const providers = Array.from({ length: MAX_AI_PROVIDERS }, (_, i) => String(formData.get(`provider_${i}`) ?? ""));
   const models: Record<string, string> = {};
-  for (const id of order) {
-    const model = String(formData.get(`model_${id}`) ?? "").trim();
-    if (!model) continue;
-    if (!MODEL_PATTERN.test(model)) return { fieldErrors: { [`model_${id}`]: "Model ids use letters, numbers and . _ : / @ - only." } };
-    models[id] = model;
-  }
-  if (freeMode && order.every((id) => getProvider(id)?.pricing === "paid")) {
-    return { error: "Free Mode needs at least one free-tier AI provider in the list." };
-  }
+  for (const id of providers) if (id) models[id] = String(formData.get(`model_${id}`) ?? "");
 
   const supabase = await createClient();
+  const wsId = ctx.current.workspace.id;
+  const [keysRes, disabledRes] = await Promise.all([
+    supabase.from("workspace_provider_credentials").select("provider").eq("workspace_id", wsId).eq("user_id", ctx.user.id),
+    supabase.from("workspace_integrations").select("provider").eq("workspace_id", wsId).eq("enabled", false),
+  ]);
+  if (keysRes.error || disabledRes.error) {
+    return { error: `Could not check provider connections: ${(keysRes.error ?? disabledRes.error)?.message}` };
+  }
+  const checked = validateGenerationSettings({
+    freeMode,
+    providers,
+    models,
+    keys: new Set((keysRes.data ?? []).map((r) => r.provider)),
+    disabled: new Set((disabledRes.data ?? []).map((r) => r.provider)),
+  });
+  if (!checked.ok) return checked.field ? { error: checked.error, fieldErrors: { [checked.field]: checked.error } } : { error: checked.error };
+
   const { error } = await supabase.from("workspace_generation_settings").upsert(
-    { workspace_id: ctx.current.workspace.id, free_mode: freeMode, ai_providers: order, ai_models: models, updated_by: ctx.user.id },
+    { workspace_id: wsId, free_mode: freeMode, ai_providers: checked.providers, ai_models: checked.models, updated_by: ctx.user.id },
     { onConflict: "workspace_id" },
   );
-  if (error) return { error: "Could not save generation settings." };
+  if (error) return { error: `Could not save generation settings: ${error.message}` };
   refresh();
   return { success: "Generation settings saved." };
 }

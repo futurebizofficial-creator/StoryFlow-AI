@@ -28,7 +28,9 @@ await db.exec(`
   grant usage on schema auth to anon, authenticated;
   grant execute on all functions in schema auth to anon, authenticated;
   grant usage on schema public to anon, authenticated;
-  alter default privileges in schema public grant all on tables to anon, authenticated;
+  -- Same as this Supabase project: new public tables give anon/authenticated no data privileges,
+  -- so every table the app uses needs an explicit grant (regression for missing grants).
+  alter default privileges in schema public grant truncate, references, trigger on tables to anon, authenticated;
   alter default privileges in schema public grant all on functions to anon, authenticated;
 `);
 await db.exec(before);

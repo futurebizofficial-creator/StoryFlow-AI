@@ -20,12 +20,15 @@ export interface GenerationSettings {
   freeMode: boolean;
   aiProviders: string[];
   aiModels: Record<string, string>;
+  /** True only when the workspace has never saved settings (original Claude behaviour). */
+  isDefault?: boolean;
 }
 
 export const DEFAULT_GENERATION_SETTINGS: GenerationSettings = {
   freeMode: false,
   aiProviders: ["anthropic"],
   aiModels: {},
+  isDefault: true,
 };
 
 export interface PlannedProvider {
@@ -43,8 +46,14 @@ export type ResolvedPlan =
   | { ok: true; providers: PlannedProvider[]; usesPaid: boolean; excluded: ExcludedProvider[] }
   | { ok: false; error: string; excluded: ExcludedProvider[] };
 
+/**
+ * Normalises a workspace_generation_settings row. Only a missing row (never configured) falls
+ * back to the original Claude default; a saved row is never silently replaced by Claude — if it
+ * has no valid providers the list is empty and generation reports that clearly.
+ * Callers must handle read errors themselves instead of passing null.
+ */
 export function normalizeSettings(row: unknown): GenerationSettings {
-  if (!row || typeof row !== "object") return { ...DEFAULT_GENERATION_SETTINGS };
+  if (!row || typeof row !== "object") return { ...DEFAULT_GENERATION_SETTINGS, aiProviders: [...DEFAULT_GENERATION_SETTINGS.aiProviders], aiModels: {} };
   const r = row as { free_mode?: unknown; ai_providers?: unknown; ai_models?: unknown };
   const providers = Array.isArray(r.ai_providers) ? r.ai_providers.filter((p): p is string => typeof p === "string" && isLlmProvider(p)) : [];
   const models: Record<string, string> = {};
@@ -55,9 +64,68 @@ export function normalizeSettings(row: unknown): GenerationSettings {
   }
   return {
     freeMode: r.free_mode === true,
-    aiProviders: providers.length ? providers.slice(0, MAX_AI_PROVIDERS) : [...DEFAULT_GENERATION_SETTINGS.aiProviders],
+    aiProviders: Array.from(new Set(providers)).slice(0, MAX_AI_PROVIDERS),
     aiModels: models,
+    isDefault: false,
   };
+}
+
+/** Whether a provider may be chosen in the settings form, and why not. Mirrors the save rules. */
+export function providerSelectability(
+  id: string,
+  ctx: { freeMode: boolean; keys: ReadonlySet<string>; disabled: ReadonlySet<string> },
+): { selectable: boolean; reason: string | null } {
+  const def = getProvider(id);
+  if (!def?.llm) return { selectable: false, reason: "Not a language model" };
+  if (ctx.disabled.has(id)) return { selectable: false, reason: "disabled for this workspace" };
+  if (!ctx.keys.has(id)) return { selectable: false, reason: "not connected" };
+  if (ctx.freeMode && def.pricing === "paid") return { selectable: false, reason: "paid — blocked in Free Mode" };
+  return { selectable: true, reason: null };
+}
+
+/**
+ * Turning Free Mode on removes paid providers from the order (primary and fallbacks) and moves
+ * the remaining providers up, so a paid provider can never stay selected-but-hidden.
+ */
+export function applyFreeModeToOrder(order: string[]): { order: string[]; removed: string[] } {
+  const removed = order.filter((id) => id && getProvider(id)?.pricing === "paid");
+  const kept = order.filter((id) => id && getProvider(id)?.pricing !== "paid");
+  return { order: Array.from({ length: order.length }, (_, i) => kept[i] ?? ""), removed };
+}
+
+/** Server-side validation for saving generation settings (shared with tests). */
+export function validateGenerationSettings(input: {
+  freeMode: boolean;
+  providers: string[];
+  models: Record<string, string>;
+  keys: ReadonlySet<string>;
+  disabled: ReadonlySet<string>;
+}): { ok: true; providers: string[]; models: Record<string, string> } | { ok: false; error: string; field?: string } {
+  const providers: string[] = [];
+  for (const id of input.providers) {
+    if (!id) continue;
+    if (!isLlmProvider(id)) return { ok: false, error: "Choose valid AI providers.", field: "provider_0" };
+    if (!providers.includes(id)) providers.push(id);
+  }
+  if (providers.length === 0) return { ok: false, error: "Choose at least one AI provider.", field: "provider_0" };
+  if (providers.length > MAX_AI_PROVIDERS) return { ok: false, error: `Choose at most ${MAX_AI_PROVIDERS} AI providers.`, field: "provider_0" };
+
+  const models: Record<string, string> = {};
+  for (const [i, id] of providers.entries()) {
+    const def = getProvider(id);
+    const name = def?.name ?? id;
+    const field = `provider_${i}`;
+    if (input.disabled.has(id)) return { ok: false, error: `${name} is disabled for this workspace. Enable it first.`, field };
+    if (!input.keys.has(id)) return { ok: false, error: `${name} is not connected. Save and test your ${name} API key first.`, field };
+    if (input.freeMode && def?.pricing === "paid") {
+      return { ok: false, error: `${name} is a paid provider and cannot be used in Free Mode (including as a fallback).`, field };
+    }
+    const model = (input.models[id] ?? "").trim();
+    if (model && !MODEL_PATTERN.test(model)) return { ok: false, error: "Model ids use letters, numbers and . _ : / @ - only.", field: `model_${id}` };
+    if (!model && !MODEL_OPTIONAL.has(id)) return { ok: false, error: `Choose a ${name} model (run Test connection to list them).`, field: `model_${id}` };
+    if (model) models[id] = model;
+  }
+  return { ok: true, providers, models };
 }
 
 export function resolveScenePlan(input: {

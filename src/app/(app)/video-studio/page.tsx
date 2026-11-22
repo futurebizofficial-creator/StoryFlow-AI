@@ -93,7 +93,9 @@ export default async function VideoStudioPage({ searchParams }: { searchParams: 
       : null;
 
   const providers = new Set((credsRes.data ?? []).map((c) => c.provider));
-  const genSettings = normalizeSettings(settingsRes.data);
+  // A read error is reported, not replaced with the Claude default.
+  const settingsError = settingsRes.error?.message ?? null;
+  const genSettings = settingsError ? { freeMode: false, aiProviders: [], aiModels: {}, isDefault: false } : normalizeSettings(settingsRes.data);
   const disabledProviders = new Set((disabledRes.data ?? []).map((r) => r.provider));
   // Availability of each configured scene-planning provider for this user (same rules the action enforces).
   const aiOptions: StudioAiOption[] = genSettings.aiProviders.map((id) => {
@@ -118,7 +120,7 @@ export default async function VideoStudioPage({ searchParams }: { searchParams: 
       <PageHeader
         eyebrow="AI Video Studio"
         title="Turn a script into a finished video"
-        description="Claude plans the scenes, Gemini creates a consistent character, and the render engine produces a narrated, captioned MP4."
+        description="Your chosen AI provider plans the scenes, Gemini creates a consistent character, and the render engine produces a narrated, captioned MP4."
         actions={
           <ButtonLink href="/videos" variant="outline">
             <Icon name="film" /> My Videos
@@ -150,7 +152,7 @@ export default async function VideoStudioPage({ searchParams }: { searchParams: 
           voiceGroups={voiceGroups}
           voiceStatus={voiceCatalog.status}
           readiness={{ gemini: providers.has("gemini"), drive: driveRes.data ? (driveRes.data.email ?? "connected") : null }}
-          ai={{ freeMode: genSettings.freeMode, options: aiOptions, canManage: ctx.canManage }}
+          ai={{ freeMode: genSettings.freeMode, options: aiOptions, canManage: ctx.canManage, isDefault: genSettings.isDefault === true, loadError: settingsError }}
         />
       )}
 

@@ -55,11 +55,15 @@ async function queueVideoJob(formData: FormData, mode: "studio" | "quick"): Prom
   // AI provider plan. Workspaces that never configured generation settings keep the original
   // behaviour (Claude) for quick renders; everything else follows the workspace plan, Free Mode
   // and explicit paid-usage confirmation.
-  const [{ data: settingsRow }, { data: keyRows }, { data: disabledRows }] = await Promise.all([
+  const [{ data: settingsRow, error: settingsError }, { data: keyRows, error: keysError }, { data: disabledRows, error: disabledError }] = await Promise.all([
     supabase.from("workspace_generation_settings").select("free_mode, ai_providers, ai_models").eq("workspace_id", ctx.current.workspace.id).maybeSingle(),
     supabase.from("workspace_provider_credentials").select("provider").eq("workspace_id", ctx.current.workspace.id).eq("user_id", ctx.user.id),
     supabase.from("workspace_integrations").select("provider").eq("workspace_id", ctx.current.workspace.id).eq("enabled", false),
   ]);
+  // Never treat an unreadable settings row as "not configured": that would silently fall back
+  // to Claude (paid) instead of the provider the workspace actually saved.
+  const readError = settingsError ?? keysError ?? disabledError;
+  if (readError) return { error: `Could not load AI provider settings: ${readError.message}`, field: "aiProvider" };
   let ai: VideoJobRequest["ai"];
   if (mode === "studio" || settingsRow) {
     const settings = normalizeSettings(settingsRow);

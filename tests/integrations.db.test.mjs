@@ -24,7 +24,9 @@ await db.exec(`
   grant usage on schema auth to anon, authenticated;
   grant execute on all functions in schema auth to anon, authenticated;
   grant usage on schema public to anon, authenticated;
-  alter default privileges in schema public grant all on tables to anon, authenticated;
+  -- Same as this Supabase project: new public tables give anon/authenticated no data privileges,
+  -- so every table the app uses needs an explicit grant (regression for missing grants).
+  alter default privileges in schema public grant truncate, references, trigger on tables to anon, authenticated;
   alter default privileges in schema public grant all on functions to anon, authenticated;
 `);
 await db.exec(sql((f) => f < "20261123"));
@@ -63,7 +65,7 @@ const wsA = (await as("owner", `select public.create_workspace('Studio A') as id
 const wsB = (await as("other", `select public.create_workspace('Studio B') as id`)).rows[0].id;
 await db.query(`insert into public.workspace_members (workspace_id, user_id, role) values ($1, $2, 'admin'), ($1, $3, 'member')`, [wsA, U.admin[0], U.member[0]]);
 const sealed = { ciphertext: "Y2lwaGVy", nonce: "bm9uY2U=", auth_tag: "dGFn" };
-await as("owner", `insert into workspace_provider_credentials (workspace_id, user_id, provider, ciphertext, nonce, auth_tag) values ($1, $2, 'anthropic', $3, $4, $5)`, [wsA, U.owner[0], sealed.ciphertext, sealed.nonce, sealed.auth_tag]);
+await db.query(`insert into workspace_provider_credentials (workspace_id, user_id, provider, ciphertext, nonce, auth_tag) values ($1, $2, 'anthropic', $3, $4, $5)`, [wsA, U.owner[0], sealed.ciphertext, sealed.nonce, sealed.auth_tag]);
 
 await db.exec(sql((f) => f >= "20261123"));
 ok("invite-only + integrations migrations apply over existing data");
@@ -119,5 +121,34 @@ await fails(null, `select * from workspace_generation_settings`, [], /permission
 await as("other", upsert, [wsB, false, ["anthropic"], "{}", U.other[0]]);
 assert.equal((await as("other", `select free_mode from workspace_generation_settings where workspace_id = $1`, [wsB])).rows[0].free_mode, false);
 ok("each workspace has its own settings");
+
+// --- Regression: explicit API grants (production defaults give no data privileges).
+const priv = async (table, p) => (await db.query(`select has_table_privilege('authenticated', $1, $2) as v`, [`public.${table}`, p])).rows[0].v;
+for (const p of ["SELECT", "INSERT", "UPDATE"]) assert.equal(await priv("workspace_generation_settings", p), true, `settings ${p}`);
+assert.equal(await priv("workspace_generation_settings", "DELETE"), false);
+for (const p of ["SELECT", "INSERT", "DELETE"]) assert.equal(await priv("workspace_invitations", p), true, `invitations ${p}`);
+assert.equal(await priv("workspaces", "INSERT"), false);
+assert.equal(await priv("workspace_members", "INSERT"), false);
+assert.equal(await priv("platform_owners", "SELECT"), false);
+assert.equal((await db.query(`select has_column_privilege('authenticated', 'public.video_jobs', 'status', 'INSERT') as v`)).rows[0].v, false);
+ok("authenticated has exactly the grants the RLS policies need (withheld privileges stay withheld)");
+
+// --- Regression: generation settings persist exactly as saved (upsert = insert then update).
+const save = `insert into workspace_generation_settings (workspace_id, free_mode, ai_providers, ai_models, updated_by)
+  values ($1, $2, $3, $4::jsonb, $5)
+  on conflict (workspace_id) do update set free_mode = excluded.free_mode, ai_providers = excluded.ai_providers,
+    ai_models = excluded.ai_models, updated_by = excluded.updated_by`;
+await as("owner", save, [wsA, true, ["mistral", "groq"], JSON.stringify({ mistral: "mistral-small", groq: "llama" }), U.owner[0]]);
+let saved = (await as("member", `select free_mode, ai_providers, ai_models from workspace_generation_settings where workspace_id = $1`, [wsA])).rows[0];
+assert.deepEqual(saved, { free_mode: true, ai_providers: ["mistral", "groq"], ai_models: { mistral: "mistral-small", groq: "llama" } });
+await as("admin", save, [wsA, false, ["groq"], JSON.stringify({ groq: "llama-2" }), U.admin[0]]);
+saved = (await as("owner", `select free_mode, ai_providers, ai_models from workspace_generation_settings where workspace_id = $1`, [wsA])).rows[0];
+assert.deepEqual(saved, { free_mode: false, ai_providers: ["groq"], ai_models: { groq: "llama-2" } });
+ok("primary, fallbacks, Free Mode and models persist and reload exactly (upsert by owner/admin)");
+
+// --- Regression: owners can create and list invitations through the API grants.
+await as("owner", `insert into workspace_invitations (workspace_id, email, role, invited_by) values ($1, 'newbie@x.com', 'member', $2)`, [wsA, U.owner[0]]);
+assert.equal((await as("owner", `select count(*)::int n from workspace_invitations where workspace_id = $1`, [wsA])).rows[0].n, 1);
+ok("owners can create and list invitations");
 
 console.log("\nAll integrations checks passed.");

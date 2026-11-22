@@ -27,7 +27,7 @@ export default async function IntegrationsPage({ searchParams }: { searchParams:
   const supabase = await createClient();
   const wsId = ctx.current.workspace.id;
 
-  const [{ data: keys }, { data: rows }, { data: settingsRow }, { data: drive }] = await Promise.all([
+  const [{ data: keys }, { data: rows }, { data: settingsRow, error: settingsError }, { data: drive }] = await Promise.all([
     // Provider names only — ciphertext never leaves the database here.
     supabase.from("workspace_provider_credentials").select("provider").eq("workspace_id", wsId).eq("user_id", ctx.user.id),
     supabase.from("workspace_integrations").select("provider, enabled, settings").eq("workspace_id", wsId),
@@ -55,7 +55,9 @@ export default async function IntegrationsPage({ searchParams }: { searchParams:
         savedKeys={(keys ?? []).map((k) => k.provider)}
         disabled={(rows ?? []).filter((r) => r.enabled === false && r.provider !== "webhook").map((r) => r.provider)}
         canManage={ctx.canManage}
-        settings={normalizeSettings(settingsRow)}
+        // A read error must not masquerade as "never configured" (which defaults to Claude).
+        settings={settingsError ? { freeMode: false, aiProviders: [], aiModels: {}, isDefault: false } : normalizeSettings(settingsRow)}
+        settingsError={settingsError?.message ?? null}
         drive={{ connected: Boolean(drive), email: drive?.email ?? null, configured: Boolean(process.env.GOOGLE_CLIENT_ID) }}
         notice={driveStatus ? (DRIVE_NOTICES[driveStatus] ?? null) : null}
       />

@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useState, useTransition } from "react";
+import { startTransition, useActionState, useState, useTransition } from "react";
 import {
   removeProviderKeyAction,
   saveGenerationSettingsAction,
@@ -9,12 +9,12 @@ import {
   testProviderAction,
 } from "@/actions/integrations-hub";
 import { disconnectDriveAction } from "@/actions/video";
-import { Badge, Card, Field, Input, Select } from "@/components/ui";
+import { Badge, buttonClass, Card, Field, Input, Select } from "@/components/ui";
 import { FormMessage, SubmitButton } from "@/components/form";
 import { Icon } from "@/components/icons";
 import { cn } from "@/lib/utils";
 import { CATEGORIES, PRICING_LABEL, type ProviderDefinition } from "@/lib/integrations/catalog";
-import { MAX_AI_PROVIDERS, type GenerationSettings } from "@/lib/integrations/plan";
+import { applyFreeModeToOrder, MAX_AI_PROVIDERS, providerSelectability, type GenerationSettings } from "@/lib/integrations/plan";
 import type { TestResult } from "@/lib/integrations/testers";
 import type { ActionState } from "@/lib/types";
 
@@ -24,6 +24,8 @@ export interface HubProps {
   disabled: string[];
   canManage: boolean;
   settings: GenerationSettings;
+  /** Database error while loading saved settings (shown instead of silently using defaults). */
+  settingsError?: string | null;
   drive: { connected: boolean; email: string | null; configured: boolean };
   notice?: { tone: "success" | "danger"; text: string } | null;
 }
@@ -63,6 +65,7 @@ export function IntegrationsHub(props: HubProps) {
             <GenerationSettingsPanel
               llms={llms}
               settings={props.settings}
+              settingsError={props.settingsError ?? null}
               canManage={props.canManage}
               keys={keys}
               disabled={disabled}
@@ -284,9 +287,11 @@ function ProviderCard({
   );
 }
 
+
 function GenerationSettingsPanel({
   llms,
   settings,
+  settingsError,
   canManage,
   keys,
   disabled,
@@ -294,76 +299,130 @@ function GenerationSettingsPanel({
 }: {
   llms: ProviderDefinition[];
   settings: GenerationSettings;
+  settingsError: string | null;
   canManage: boolean;
   keys: Set<string>;
   disabled: Set<string>;
   models: Record<string, string[]>;
 }) {
-  const [state, action] = useActionState(saveGenerationSettingsAction, {} as ActionState);
+  const [state, action, pending] = useActionState(saveGenerationSettingsAction, {} as ActionState);
   const [freeMode, setFreeMode] = useState(settings.freeMode);
   const [order, setOrder] = useState<string[]>(() => Array.from({ length: MAX_AI_PROVIDERS }, (_, i) => settings.aiProviders[i] ?? ""));
   const [modelValues, setModelValues] = useState<Record<string, string>>(settings.aiModels);
-  const chosen = order.filter(Boolean);
+  const [removedNotice, setRemovedNotice] = useState<string | null>(null);
+  const chosen = Array.from(new Set(order.filter(Boolean)));
   const name = (id: string) => llms.find((l) => l.id === id)?.name ?? id;
+  const ctx = { freeMode, keys, disabled };
+
+  const toggleFreeMode = (on: boolean) => {
+    setFreeMode(on);
+    if (on) {
+      const { order: next, removed } = applyFreeModeToOrder(order);
+      setOrder(next);
+      setRemovedNotice(removed.length ? `Removed paid provider${removed.length > 1 ? "s" : ""} for Free Mode: ${removed.map(name).join(", ")}.` : null);
+    } else {
+      setRemovedNotice(null);
+    }
+  };
 
   return (
     <Card className="relative overflow-hidden">
       <div className="glow absolute inset-0 opacity-40" aria-hidden="true" />
-      <form action={action} className="relative space-y-5 p-5">
+      <form
+        // Submitted from component state, not the DOM: React would otherwise reset the form after
+        // the action (showing stale defaults such as Claude), and disabled options are never sent.
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!canManage || pending) return;
+          const fd = new FormData();
+          fd.set("freeMode", freeMode ? "true" : "false");
+          order.forEach((id, i) => fd.set(`provider_${i}`, id));
+          for (const id of chosen) fd.set(`model_${id}`, modelValues[id] ?? "");
+          startTransition(() => action(fd));
+        }}
+        aria-busy={pending}
+        className="relative space-y-5 p-5"
+      >
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h3 className="text-[15px] font-semibold tracking-tight">Video generation providers</h3>
             <p className="text-[13px] text-muted">Scene planning tries these in order. Fallback happens only to providers listed here.</p>
           </div>
           <label className={cn("flex items-center gap-2 text-sm font-medium", !canManage && "opacity-60")}>
-            <input type="hidden" name="freeMode" value={freeMode ? "true" : "false"} />
-            <input type="checkbox" checked={freeMode} disabled={!canManage} onChange={(e) => setFreeMode(e.target.checked)} className="size-4 accent-[var(--accent)]" />
-            Free Mode
+            <input type="checkbox" checked={freeMode} disabled={!canManage} onChange={(e) => toggleFreeMode(e.target.checked)} className="size-4 accent-[var(--accent)]" />
+            Free Mode <Badge tone={freeMode ? "success" : "neutral"}>{freeMode ? "On" : "Off"}</Badge>
           </label>
         </div>
+
+        {settingsError && (
+          <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-xs text-danger">
+            Saved settings could not be loaded: {settingsError}
+          </p>
+        )}
+        {settings.isDefault && !settingsError && (
+          <p className="rounded-lg bg-surface-2 px-3 py-2 text-xs text-muted">
+            Not configured yet — renders use Anthropic Claude (Paid) until you save a provider here.
+          </p>
+        )}
 
         <p className={cn("rounded-lg px-3 py-2 text-xs", freeMode ? "bg-success-soft text-success" : "bg-warning-soft text-warning")}>
           {freeMode
             ? "Free Mode is on: only free and free-tier providers are used, there is never a paid fallback, and a render stops if the free quota is exhausted. A free-tier key can still be billed if its account has billing enabled. Rendering and hosting costs are separate."
             : "Free Mode is off: paid providers can be used, but each render must confirm paid usage first. Turn on Free Mode to block paid providers entirely."}
         </p>
+        {removedNotice && <p role="status" className="text-xs text-warning">{removedNotice}</p>}
 
         <div className="grid gap-3 md:grid-cols-2">
-          {order.map((value, i) => (
-            <Field key={i} label={i === 0 ? "Primary" : `Fallback ${i}`} htmlFor={`provider_${i}`} error={state.fieldErrors?.[`provider_${i}`]}>
-              <Select
-                id={`provider_${i}`}
-                name={`provider_${i}`}
-                value={value}
-                disabled={!canManage}
-                onChange={(e) => setOrder((o) => o.map((v, j) => (j === i ? e.target.value : v)))}
-              >
-                <option value="">{i === 0 ? "Choose a provider" : "None"}</option>
-                {llms.map((l) => (
-                  <option key={l.id} value={l.id} disabled={freeMode && l.pricing === "paid"}>
-                    {l.name} · {PRICING_LABEL[l.pricing]}
-                    {disabled.has(l.id) ? " · disabled" : ""}
-                    {keys.has(l.id) ? "" : " · no key (yours)"}
-                  </option>
-                ))}
-              </Select>
-            </Field>
-          ))}
+          {order.map((value, i) => {
+            const current = value ? providerSelectability(value, ctx) : null;
+            return (
+              <Field key={i} label={i === 0 ? "Primary" : `Fallback ${i}`} htmlFor={`provider_${i}`} error={state.fieldErrors?.[`provider_${i}`]}>
+                <Select
+                  id={`provider_${i}`}
+                  value={value}
+                  disabled={!canManage}
+                  onChange={(e) => setOrder((o) => o.map((v, j) => (j === i ? e.target.value : v)))}
+                >
+                  <option value="">{i === 0 ? "Choose a provider" : "None"}</option>
+                  {llms.map((l) => {
+                    const sel = providerSelectability(l.id, ctx);
+                    const usedElsewhere = order.some((v, j) => j !== i && v === l.id);
+                    return (
+                      <option key={l.id} value={l.id} disabled={(!sel.selectable && value !== l.id) || usedElsewhere}>
+                        {l.name} · {PRICING_LABEL[l.pricing]}
+                        {sel.reason ? ` · ${sel.reason}` : ""}
+                      </option>
+                    );
+                  })}
+                </Select>
+                {current && !current.selectable && (
+                  <span className="text-xs text-danger">
+                    {name(value)} is {current.reason}. Choose another provider.
+                  </span>
+                )}
+              </Field>
+            );
+          })}
         </div>
 
         {chosen.length > 0 && (
           <div className="grid gap-3 md:grid-cols-2">
-            {Array.from(new Set(chosen)).map((id) => (
+            {chosen.map((id) => (
               <Field
                 key={id}
                 label={`${name(id)} model`}
                 htmlFor={`model_${id}`}
-                hint={id === "anthropic" ? "Optional — defaults to the worker's CLAUDE_MODEL." : models[id]?.length ? `${models[id].length} models from your connection test.` : "Run Test connection on the card to list models."}
+                hint={
+                  id === "anthropic"
+                    ? "Optional — defaults to the worker's CLAUDE_MODEL."
+                    : models[id]?.length
+                      ? `${models[id].length} models from your connection test.`
+                      : "Required. Run Test connection on the card to list models."
+                }
                 error={state.fieldErrors?.[`model_${id}`]}
               >
                 <Input
                   id={`model_${id}`}
-                  name={`model_${id}`}
                   list={`models-${id}`}
                   value={modelValues[id] ?? ""}
                   onChange={(e) => setModelValues((m) => ({ ...m, [id]: e.target.value }))}
@@ -374,7 +433,9 @@ function GenerationSettingsPanel({
                   placeholder="Model id"
                 />
                 <datalist id={`models-${id}`}>
-                  {(models[id] ?? []).map((m) => <option key={m} value={m} />)}
+                  {(models[id] ?? []).map((m) => (
+                    <option key={m} value={m} />
+                  ))}
                 </datalist>
               </Field>
             ))}
@@ -383,7 +444,10 @@ function GenerationSettingsPanel({
 
         <div className="flex flex-wrap items-center gap-3">
           {canManage ? (
-            <SubmitButton size="sm" pendingText="Saving…">Save generation settings</SubmitButton>
+            <button type="submit" disabled={pending} aria-busy={pending} className={buttonClass("primary", "sm")}>
+              {pending && <span className="size-3.5 animate-spin rounded-full border-2 border-current border-r-transparent" aria-hidden="true" />}
+              {pending ? "Saving…" : "Save generation settings"}
+            </button>
           ) : (
             <p className="text-xs text-muted">Only owners and admins can change these settings.</p>
           )}

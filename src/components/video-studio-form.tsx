@@ -60,7 +60,15 @@ export function VideoStudioForm({
   scripts: StudioScript[];
   initialScriptId: string;
   readiness: { gemini: boolean; drive: string | null };
-  ai: { freeMode: boolean; options: StudioAiOption[]; canManage: boolean };
+  ai: {
+    freeMode: boolean;
+    options: StudioAiOption[];
+    canManage: boolean;
+    /** Workspace never saved generation settings (renders use the original Claude default). */
+    isDefault?: boolean;
+    /** Database error while loading saved settings. */
+    loadError?: string | null;
+  };
   voiceGroups: VoicePickerGroup[] | null;
   voiceStatus: "ok" | "unconfigured" | "unavailable";
 }) {
@@ -267,6 +275,20 @@ export function VideoStudioForm({
             <Badge tone={ai.freeMode ? "success" : "neutral"} dot>{ai.freeMode ? "Free Mode on" : "Free Mode off"}</Badge>
           </div>
           <div className="space-y-3 p-5">
+            {ai.loadError && (
+              <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-xs text-danger">
+                AI provider settings could not be loaded: {ai.loadError}
+              </p>
+            )}
+            {ai.isDefault && !ai.loadError && (
+              <p className="rounded-lg bg-surface-2 px-3 py-2 text-xs text-muted">
+                This workspace has not saved AI provider settings yet, so renders use Anthropic Claude (Paid). Choose free
+                providers in Integrations.
+              </p>
+            )}
+            {!ai.loadError && ai.options.length === 0 && (
+              <p className="rounded-lg bg-warning-soft px-3 py-2 text-xs text-warning">No AI providers are configured for this workspace.</p>
+            )}
             <Field
               label="Primary provider"
               htmlFor="aiProvider"

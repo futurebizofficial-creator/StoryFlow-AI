@@ -2,7 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { CATEGORIES, KEY_PROVIDER_IDS, LLM_PROVIDER_IDS, PROVIDERS } from "../src/lib/integrations/catalog.ts";
-import { normalizeSettings, resolveScenePlan, type GenerationSettings } from "../src/lib/integrations/plan.ts";
+import {
+  applyFreeModeToOrder,
+  normalizeSettings,
+  providerSelectability,
+  resolveScenePlan,
+  validateGenerationSettings,
+  type GenerationSettings,
+} from "../src/lib/integrations/plan.ts";
 import { elevenLabsUsage, modelIdsFromList, usageFromHeaders } from "../src/lib/integrations/limits.ts";
 import {
   extractKeywords,
@@ -101,12 +108,62 @@ test("plan: disabled providers and unconfigured primaries are rejected", () => {
   assert.ok(primary.ok && primary.providers[0].id === "anthropic" && primary.providers[1].id === "groq");
 });
 
-test("settings normalisation drops unknown providers and bad models; defaults to Claude", () => {
-  assert.deepEqual(normalizeSettings(null), { freeMode: false, aiProviders: ["anthropic"], aiModels: {} });
+test("settings normalisation drops unknown providers and bad models; only a missing row defaults to Claude", () => {
+  assert.deepEqual(normalizeSettings(null), { freeMode: false, aiProviders: ["anthropic"], aiModels: {}, isDefault: true });
   assert.deepEqual(
     normalizeSettings({ free_mode: true, ai_providers: ["groq", "evil", 3], ai_models: { groq: "ok-model", openai: "bad model!", x: "y" } }),
-    { freeMode: true, aiProviders: ["groq"], aiModels: { groq: "ok-model" } },
+    { freeMode: true, aiProviders: ["groq"], aiModels: { groq: "ok-model" }, isDefault: false },
   );
+});
+
+test("regression: a saved free provider is never replaced by Claude", () => {
+  // Saved row whose providers are all invalid → empty list (clear error), not Claude.
+  const broken = normalizeSettings({ free_mode: false, ai_providers: ["removed_provider"], ai_models: {} });
+  assert.deepEqual(broken.aiProviders, []);
+  const plan = resolveScenePlan({ settings: broken, keys: new Set(["anthropic"]), disabled: new Set() });
+  assert.equal(plan.ok, false);
+  // Saved Groq primary → studio and generation use Groq, with no Claude anywhere in the chain.
+  const saved = normalizeSettings({ free_mode: true, ai_providers: ["groq"], ai_models: { groq: "llama" } });
+  const groq = resolveScenePlan({ settings: saved, primary: "groq", keys: new Set(["groq", "anthropic"]), disabled: new Set() });
+  assert.ok(groq.ok);
+  if (groq.ok) assert.deepEqual(groq.providers.map((p) => p.id), ["groq"]);
+  const noPrimary = resolveScenePlan({ settings: saved, keys: new Set(["groq", "anthropic"]), disabled: new Set() });
+  assert.ok(noPrimary.ok && noPrimary.providers.every((p) => p.id !== "anthropic"));
+});
+
+test("regression: saving validates enabled, connected, Free Mode and models server-side", () => {
+  const base = { freeMode: false, keys: new Set(["groq", "gemini", "anthropic"]), disabled: new Set<string>() };
+  const ok = validateGenerationSettings({ ...base, providers: ["groq", "", "gemini", "groq"], models: { groq: " llama ", gemini: "g-1" } });
+  assert.deepEqual(ok, { ok: true, providers: ["groq", "gemini"], models: { groq: "llama", gemini: "g-1" } });
+  // Primary left empty but a fallback chosen still saves (no false "choose at least one").
+  assert.equal(validateGenerationSettings({ ...base, providers: ["", "groq"], models: { groq: "m" } }).ok, true);
+  const cases: Array<[Parameters<typeof validateGenerationSettings>[0], RegExp]> = [
+    [{ ...base, providers: ["", "", ""], models: {} }, /at least one/],
+    [{ ...base, providers: ["evil"], models: {} }, /valid AI providers/],
+    [{ ...base, providers: ["mistral"], models: { mistral: "m" } }, /not connected/],
+    [{ ...base, disabled: new Set(["groq"]), providers: ["groq"], models: { groq: "m" } }, /disabled for this workspace/],
+    [{ ...base, freeMode: true, providers: ["groq", "anthropic"], models: { groq: "m" } }, /paid provider and cannot be used in Free Mode \(including as a fallback\)/],
+    [{ ...base, providers: ["groq"], models: {} }, /Choose a Groq model/],
+    [{ ...base, providers: ["groq"], models: { groq: "bad model" } }, /Model ids/],
+  ];
+  for (const [input, re] of cases) {
+    const r = validateGenerationSettings(input);
+    assert.equal(r.ok, false, JSON.stringify(input.providers));
+    if (!r.ok) assert.match(r.error, re);
+  }
+  assert.equal(validateGenerationSettings({ ...base, providers: ["anthropic"], models: {} }).ok, true, "Claude model is optional");
+});
+
+test("regression: settings form selectability and Free Mode pruning", () => {
+  const ctx = { freeMode: true, keys: new Set(["groq", "anthropic"]), disabled: new Set(["gemini"]) };
+  assert.deepEqual(providerSelectability("groq", ctx), { selectable: true, reason: null });
+  assert.equal(providerSelectability("anthropic", ctx).selectable, false);
+  assert.match(providerSelectability("anthropic", ctx).reason ?? "", /Free Mode/);
+  assert.match(providerSelectability("gemini", ctx).reason ?? "", /disabled/);
+  assert.match(providerSelectability("mistral", ctx).reason ?? "", /not connected/);
+  assert.equal(providerSelectability("anthropic", { ...ctx, freeMode: false }).selectable, true);
+  assert.deepEqual(applyFreeModeToOrder(["anthropic", "groq", "openai", "gemini"]), { order: ["groq", "gemini", "", ""], removed: ["anthropic", "openai"] });
+  assert.deepEqual(applyFreeModeToOrder(["groq", "", "", ""]), { order: ["groq", "", "", ""], removed: [] });
 });
 
 // ---------------------------------------------------------------------------
