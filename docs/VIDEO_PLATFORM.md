@@ -30,3 +30,16 @@ AI Video Studio stores these in `video_jobs.request`; the worker re-validates th
 After rendering, the worker downloads AVG's `GET /files/:publicId/thumbnail` and stores it as `<workspace>/<job>/thumbnail.jpg` in the private bucket. Pages fall back to the Gemini character reference when no thumbnail exists.
 
 Not exposed because AVG's job API currently drops them before rendering: `musicVolume`, `captionMode`.
+
+## Scene-planning providers, fallback and Free Mode
+
+AI Video Studio stores a provider plan in `video_jobs.request.ai` (`providers` in order with models, `freeMode`, `paidAcknowledged`). The worker (`worker/llm-providers.mjs`) re-validates it against `src/lib/integrations/catalog.json`:
+
+- Only providers in the plan are called, in order, with the job creator's own keys. Missing keys and workspace-disabled providers are skipped, never substituted.
+- Fallback to the next provider happens on quota (429/402), auth or availability errors. When every provider fails the job stops with a per-provider summary.
+- Free Mode: paid providers are rejected outright; a quota error stops generation instead of falling back.
+- Paid providers require the render to confirm paid usage.
+- Jobs without a plan (older jobs, quick renders in workspaces with no generation settings) use Claude exactly as before, and are refused in Free Mode workspaces.
+
+The Gemini character reference still uses the user's Gemini key; a Gemini quota error stops the job with a clear message. Voice, music and stock footage remain inside Automated Video Generator.
+

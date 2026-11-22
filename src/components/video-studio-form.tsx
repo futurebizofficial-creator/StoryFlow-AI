@@ -38,16 +38,29 @@ const ORIENTATIONS = [
 
 const capitalize = (s: string) => s[0].toUpperCase() + s.slice(1);
 
+export interface StudioAiOption {
+  id: string;
+  name: string;
+  pricing: "free" | "free_tier" | "paid";
+  model: string | null;
+  available: boolean;
+  reason: string | null;
+  /** Providers tried in order when this one is the primary (only configured, available ones). */
+  chain: Array<{ id: string; name: string; paid: boolean }>;
+}
+
 export function VideoStudioForm({
   scripts,
   initialScriptId,
   readiness,
   voiceGroups,
   voiceStatus,
+  ai,
 }: {
   scripts: StudioScript[];
   initialScriptId: string;
-  readiness: { claude: boolean; gemini: boolean; drive: string | null };
+  readiness: { gemini: boolean; drive: string | null };
+  ai: { freeMode: boolean; options: StudioAiOption[]; canManage: boolean };
   voiceGroups: VoicePickerGroup[] | null;
   voiceStatus: "ok" | "unconfigured" | "unavailable";
 }) {
@@ -66,8 +79,13 @@ export function VideoStudioForm({
   const selected = useMemo(() => scripts.find((s) => s.id === scriptId), [scripts, scriptId]);
   const [tone, setTone] = useState(selected && VIDEO_TONES.includes(selected.tone) ? selected.tone : "conversational");
 
-  const keysReady = readiness.claude && readiness.gemini;
-  const canGenerate = Boolean(selected && !selected.issue && keysReady);
+  const [aiProvider, setAiProvider] = useState(() => ai.options.find((o) => o.available)?.id ?? "");
+  const [paidConfirmed, setPaidConfirmed] = useState(false);
+  const aiChoice = ai.options.find((o) => o.id === aiProvider);
+  const usesPaid = Boolean(aiChoice?.chain.some((p) => p.paid));
+  const aiReady = Boolean(aiChoice?.available);
+  const keysReady = aiReady && readiness.gemini;
+  const canGenerate = Boolean(selected && !selected.issue && keysReady && (!usesPaid || paidConfirmed));
 
   const chooseScript = (id: string) => {
     setScriptId(id);
@@ -201,7 +219,7 @@ export function VideoStudioForm({
             </div>
           </div>
           <div className="grid gap-4 p-5 sm:grid-cols-2">
-            <Field label="Tone" htmlFor="tone" hint="Guides Claude's scene and visual-cue planning." error={state.fieldErrors?.tone}>
+            <Field label="Tone" htmlFor="tone" hint="Guides AI scene and visual-cue planning." error={state.fieldErrors?.tone}>
               <Select id="tone" name="tone" value={tone} onChange={(e) => setTone(e.target.value)}>
                 {VIDEO_TONES.map((t) => (
                   <option key={t} value={t}>
@@ -238,10 +256,52 @@ export function VideoStudioForm({
           </div>
         </Card>
 
-        {/* 4. Subtitles */}
+        {/* 4. AI scene planning */}
         <Card>
           <div className="flex items-center gap-3 border-b border-border px-5 py-4">
             <StepNumber n={4} />
+            <div className="min-w-0 flex-1">
+              <h2 className="text-[15px] font-semibold tracking-tight">AI scene planning</h2>
+              <p className="text-[13px] text-muted">Turns your script into scenes and visual cues. Uses your own API key.</p>
+            </div>
+            <Badge tone={ai.freeMode ? "success" : "neutral"} dot>{ai.freeMode ? "Free Mode on" : "Free Mode off"}</Badge>
+          </div>
+          <div className="space-y-3 p-5">
+            <Field
+              label="Primary provider"
+              htmlFor="aiProvider"
+              error={err.aiProvider}
+              hint={aiChoice?.available ? undefined : (aiChoice?.reason ?? "Configure providers in Integrations.")}
+            >
+              <Select id="aiProvider" name="aiProvider" value={aiProvider} onChange={(e) => { setAiProvider(e.target.value); setPaidConfirmed(false); }}>
+                <option value="" disabled>Choose a provider…</option>
+                {ai.options.map((o) => (
+                  <option key={o.id} value={o.id} disabled={!o.available}>
+                    {o.name}{o.model ? ` · ${o.model}` : ""} · {o.pricing === "paid" ? "Paid" : o.pricing === "free" ? "Free" : "Free tier"}{o.available ? "" : " · unavailable"}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            {aiChoice?.available && aiChoice.chain.length > 1 && (
+              <p className="text-xs text-muted">
+                If {aiChoice.name} fails or runs out of quota, StoryFlow tries:{" "}
+                {aiChoice.chain.slice(1).map((p) => `${p.name}${p.paid ? " (paid)" : ""}`).join(" → ")}. No other provider is used.
+              </p>
+            )}
+            {aiChoice?.available && aiChoice.chain.length === 1 && (
+              <p className="text-xs text-muted">No fallback is configured; if this provider fails, the render stops with an error.</p>
+            )}
+            <p className="text-xs text-muted">
+              {ai.canManage ? "Change providers, models, fallbacks and Free Mode in " : "Owners and admins manage providers and Free Mode in "}
+              <Link href="/settings/integrations#ai" className="font-medium text-accent hover:underline">Integrations</Link>.
+            </p>
+          </div>
+        </Card>
+
+        {/* 5. Subtitles */}
+        <Card>
+          <div className="flex items-center gap-3 border-b border-border px-5 py-4">
+            <StepNumber n={5} />
             <div className="min-w-0 flex-1">
               <h2 className="text-[15px] font-semibold tracking-tight">Subtitles</h2>
               <p className="text-[13px] text-muted">Burned-in captions styled by the render engine.</p>
@@ -342,10 +402,10 @@ export function VideoStudioForm({
           )}
         </Card>
 
-        {/* 5. Music */}
+        {/* 6. Music */}
         <Card>
           <div className="flex items-center gap-3 border-b border-border px-5 py-4">
-            <StepNumber n={5} />
+            <StepNumber n={6} />
             <div>
               <h2 className="text-[15px] font-semibold tracking-tight">Background music</h2>
               <p className="text-[13px] text-muted">Mixed under the narration with automatic ducking.</p>
@@ -417,7 +477,7 @@ export function VideoStudioForm({
             </div>
 
             <div className="space-y-2 text-[13px]">
-              <Requirement ok={readiness.claude} label="Claude API key" href="/settings/integrations" />
+              <Requirement ok={aiReady} label={aiChoice ? `AI provider: ${aiChoice.name}` : "AI provider"} href="/settings/integrations#ai" />
               <Requirement ok={readiness.gemini} label="Gemini API key" href="/settings/integrations" />
               <Requirement ok={Boolean(selected && !selected.issue)} label="Renderable script" />
               <div className="flex items-center justify-between gap-2 rounded-lg px-1 py-1">
@@ -429,10 +489,22 @@ export function VideoStudioForm({
             </div>
 
             {!keysReady && (
-              <Alert tone="warning" title="Add your AI keys">
-                Video generation uses your own Claude and Gemini keys. Add them in{" "}
+              <Alert tone="warning" title="Finish AI setup">
+                Video generation uses your own keys: an available AI provider for scene planning and Gemini for the character
+                reference. Set them up in{" "}
                 <Link href="/settings/integrations" className="font-medium underline">Integrations</Link>.
               </Alert>
+            )}
+
+            {usesPaid && (
+              <label className="flex items-start gap-2 rounded-lg bg-warning-soft px-3 py-2 text-xs text-warning">
+                <input type="checkbox" checked={paidConfirmed} onChange={(e) => setPaidConfirmed(e.target.checked)} className="mt-0.5 size-3.5 accent-[var(--accent)]" />
+                <span>
+                  This render may use a paid provider ({aiChoice?.chain.filter((p) => p.paid).map((p) => p.name).join(", ")}). Charges go to
+                  your own API account. I confirm paid usage.
+                </span>
+                {paidConfirmed && <input type="hidden" name="paidAcknowledged" value="true" />}
+              </label>
             )}
 
             <FormMessage state={state} />

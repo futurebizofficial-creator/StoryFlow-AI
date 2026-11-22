@@ -92,6 +92,12 @@ export interface VideoJobRequest {
   textConfig?: SubtitleTextConfig;
   /** AVG music filename in the engine's input/bgm library. Absent means automatic music. */
   backgroundMusic?: string;
+  /** Scene-planning providers in fallback order. Absent on older jobs (Claude only). */
+  ai?: {
+    providers: Array<{ id: string; model: string | null }>;
+    freeMode: boolean;
+    paidAcknowledged: boolean;
+  };
 }
 
 export interface VideoJob {

@@ -89,7 +89,16 @@ worker only. Env vars are read at request time, so changing them only needs a re
 
 ## Integrations
 
-The Integrations page stores per-workspace, non-secret preferences (enabled flag, default model,
-voice ID, webhook URL). Provider keys belong in server env vars (`ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, `ELEVENLABS_API_KEY`, `YOUTUBE_CLIENT_ID`/`SECRET`); the UI only reports whether a
-variable exists and never claims a connection. No provider API calls are made in Milestone 1.
+The Integrations Hub (Settings → Integrations) lists every provider from
+`src/lib/integrations/catalog.json` by category with Free / Free tier / Paid labels, docs links and status.
+
+- **API keys** are per user and per workspace, encrypted with `STORYFLOW_CREDENTIALS_KEY` (AES-256-GCM) in
+  `workspace_provider_credentials`. Nobody else — owners included — can read them. No provider keys go in env vars.
+- **Test connection** calls only free, read-only endpoints (model lists, account or quota info) and shows
+  usage limits when the provider returns them.
+- **Enable/Disable** per workspace and **video generation settings** (Free Mode, scene-planning provider
+  order, models) are owner/admin only.
+- **Stock media search** (`/settings/integrations/stock`) uses the official Pexels, Pixabay, Unsplash,
+  Wikimedia Commons and Internet Archive APIs, keeps creator/source/licence, and never downloads files.
+- YouTube, TikTok, Pinterest and Canva need approved developer apps before they can be connected;
+  CapCut and Mixkit are manual workflows (no public API).

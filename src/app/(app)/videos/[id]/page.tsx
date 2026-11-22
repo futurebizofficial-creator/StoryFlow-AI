@@ -14,6 +14,7 @@ import { isActiveJob, PIPELINE_STEPS, pipelineStepIndex, stageLabel } from "@/li
 import { cn, formatDuration, isUuid, timeAgo } from "@/lib/utils";
 import type { VideoJob } from "@/lib/types";
 import { settingsToFormEntries } from "@/lib/video/render-settings";
+import { getProvider, PRICING_LABEL } from "@/lib/integrations/catalog";
 
 export const metadata: Metadata = { title: "Video" };
 
@@ -247,6 +248,16 @@ export default async function VideoDetailPage({
                 />
               )}
               <Row label="Music" value={job.request.backgroundMusic || <span className="text-muted">Automatic</span>} />
+              <Row
+                label="AI providers"
+                value={
+                  job.request.ai
+                    ? job.request.ai.providers
+                        .map((p) => `${getProvider(p.id)?.name ?? p.id}${p.model ? ` (${p.model})` : ""}`)
+                        .join(" → ") + (job.request.ai.freeMode ? " · Free Mode" : "")
+                    : "Anthropic Claude"
+                }
+              />
               {job.request.targetDuration ? <Row label="Target length" value={formatDuration(job.request.targetDuration)} /> : null}
               <Row label="Attempts" value={String(job.attempts)} />
               {job.completed_at && <Row label="Finished" value={new Date(job.completed_at).toLocaleString()} />}
@@ -264,6 +275,10 @@ export default async function VideoDetailPage({
                     orientation={orientation}
                     tone={job.request.tone}
                     settings={settingsToFormEntries(job.request)}
+                    aiProvider={job.request.ai?.providers[0]?.id}
+                    paidProviders={(job.request.ai?.providers ?? [])
+                      .filter((p) => getProvider(p.id)?.pricing === "paid")
+                      .map((p) => `${getProvider(p.id)?.name ?? p.id} (${PRICING_LABEL.paid})`)}
                     label={job.status === "failed" ? "Try again" : "Generate again"}
                   />
                 )}

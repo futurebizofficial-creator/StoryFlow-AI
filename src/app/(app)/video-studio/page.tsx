@@ -14,6 +14,9 @@ import { isActiveJob, VIDEO_SCRIPT_MAX, VIDEO_SCRIPT_MIN } from "@/lib/video/sta
 import { isUuid } from "@/lib/utils";
 import { listEngineVoices } from "@/lib/video/engines";
 import type { VoicePickerGroup } from "@/components/voice-picker";
+import { getProvider } from "@/lib/integrations/catalog";
+import { normalizeSettings, resolveScenePlan } from "@/lib/integrations/plan";
+import type { StudioAiOption } from "@/components/video-studio-form";
 
 export const metadata: Metadata = { title: "AI Video Studio" };
 
@@ -33,7 +36,7 @@ export default async function VideoStudioPage({ searchParams }: { searchParams: 
   const supabase = await createClient();
   const wsId = ctx.current.workspace.id;
 
-  const [scriptsRes, credsRes, driveRes, jobsRes, voiceCatalog] = await Promise.all([
+  const [scriptsRes, credsRes, driveRes, jobsRes, voiceCatalog, settingsRes, disabledRes] = await Promise.all([
     supabase
       .from("scripts")
       .select("id,title,content,tone,target_duration_seconds,updated_at")
@@ -50,6 +53,8 @@ export default async function VideoStudioPage({ searchParams }: { searchParams: 
       .limit(5),
     // Server-only call to AVG GET /api/voices (cached for an hour); never exposes the engine URL or token.
     listEngineVoices(),
+    supabase.from("workspace_generation_settings").select("free_mode, ai_providers, ai_models").eq("workspace_id", wsId).maybeSingle(),
+    supabase.from("workspace_integrations").select("provider").eq("workspace_id", wsId).eq("enabled", false),
   ]);
 
   const scripts: StudioScript[] = (scriptsRes.data ?? []).map((s) => {
@@ -88,6 +93,22 @@ export default async function VideoStudioPage({ searchParams }: { searchParams: 
       : null;
 
   const providers = new Set((credsRes.data ?? []).map((c) => c.provider));
+  const genSettings = normalizeSettings(settingsRes.data);
+  const disabledProviders = new Set((disabledRes.data ?? []).map((r) => r.provider));
+  // Availability of each configured scene-planning provider for this user (same rules the action enforces).
+  const aiOptions: StudioAiOption[] = genSettings.aiProviders.map((id) => {
+    const plan = resolveScenePlan({ settings: genSettings, primary: id, keys: providers, disabled: disabledProviders });
+    const def = getProvider(id);
+    return {
+      id,
+      name: def?.name ?? id,
+      pricing: def?.pricing ?? "paid",
+      model: genSettings.aiModels[id] ?? null,
+      available: plan.ok,
+      reason: plan.ok ? null : plan.error,
+      chain: plan.ok ? plan.providers.map((p) => ({ id: p.id, name: getProvider(p.id)?.name ?? p.id, paid: p.paid })) : [],
+    };
+  });
   const jobs = (jobsRes.data ?? []) as unknown as VideoJobListItem[];
   const initialScriptId = isUuid(requested) && scripts.some((s) => s.id === requested) ? requested : (scripts.find((s) => !s.issue)?.id ?? "");
 
@@ -128,7 +149,8 @@ export default async function VideoStudioPage({ searchParams }: { searchParams: 
           initialScriptId={initialScriptId}
           voiceGroups={voiceGroups}
           voiceStatus={voiceCatalog.status}
-          readiness={{ claude: providers.has("anthropic"), gemini: providers.has("gemini"), drive: driveRes.data ? (driveRes.data.email ?? "connected") : null }}
+          readiness={{ gemini: providers.has("gemini"), drive: driveRes.data ? (driveRes.data.email ?? "connected") : null }}
+          ai={{ freeMode: genSettings.freeMode, options: aiOptions, canManage: ctx.canManage }}
         />
       )}
 

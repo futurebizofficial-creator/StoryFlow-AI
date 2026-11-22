@@ -5,9 +5,9 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { getWorkspaceContext } from "@/lib/workspace";
 import { isUuid } from "@/lib/utils";
-import { encryptSecret } from "@/lib/video/crypto";
 import { VIDEO_SCRIPT_MAX, VIDEO_SCRIPT_MIN, VIDEO_TONES } from "@/lib/video/status";
 import { parseRenderSettings } from "@/lib/video/render-settings";
+import { normalizeSettings, resolveScenePlan } from "@/lib/integrations/plan";
 import type { ActionState, VideoJobRequest } from "@/lib/types";
 
 type QueueResult = { id: string } | { error: string; field?: string };
@@ -18,7 +18,7 @@ type QueueResult = { id: string } | { error: string; field?: string };
  * background music) plus tone for scene planning; duration comes from the script.
  * Status, progress and output fields stay worker-owned.
  */
-async function queueVideoJob(formData: FormData): Promise<QueueResult> {
+async function queueVideoJob(formData: FormData, mode: "studio" | "quick"): Promise<QueueResult> {
   const ctx = await getWorkspaceContext();
   const scriptId = formData.get("scriptId");
   if (!isUuid(scriptId)) return { error: "Choose a script to render.", field: "scriptId" };
@@ -52,6 +52,38 @@ async function queueVideoJob(formData: FormData): Promise<QueueResult> {
     return { error: "The video engine accepts scripts up to 4,900 characters. Shorten the script before rendering.", field: "scriptId" };
   }
 
+  // AI provider plan. Workspaces that never configured generation settings keep the original
+  // behaviour (Claude) for quick renders; everything else follows the workspace plan, Free Mode
+  // and explicit paid-usage confirmation.
+  const [{ data: settingsRow }, { data: keyRows }, { data: disabledRows }] = await Promise.all([
+    supabase.from("workspace_generation_settings").select("free_mode, ai_providers, ai_models").eq("workspace_id", ctx.current.workspace.id).maybeSingle(),
+    supabase.from("workspace_provider_credentials").select("provider").eq("workspace_id", ctx.current.workspace.id).eq("user_id", ctx.user.id),
+    supabase.from("workspace_integrations").select("provider").eq("workspace_id", ctx.current.workspace.id).eq("enabled", false),
+  ]);
+  let ai: VideoJobRequest["ai"];
+  if (mode === "studio" || settingsRow) {
+    const settings = normalizeSettings(settingsRow);
+    const primaryRaw = mode === "studio" ? String(formData.get("aiProvider") ?? "") : "";
+    const plan = resolveScenePlan({
+      settings,
+      primary: primaryRaw || null,
+      keys: new Set((keyRows ?? []).map((r) => r.provider)),
+      disabled: new Set((disabledRows ?? []).map((r) => r.provider)),
+    });
+    if (!plan.ok) return { error: plan.error, field: "aiProvider" };
+    const acknowledged = formData.get("paidAcknowledged") === "true";
+    if (plan.usesPaid && !acknowledged) {
+      return mode === "studio"
+        ? { error: "This render can use a paid AI provider. Confirm paid usage to continue.", field: "paidAcknowledged" }
+        : { error: "This workspace's AI providers include a paid provider. Use AI Video Studio to confirm paid usage." };
+    }
+    ai = {
+      providers: plan.providers.map((p) => ({ id: p.id, model: p.model })),
+      freeMode: settings.freeMode,
+      paidAcknowledged: plan.usesPaid,
+    };
+  }
+
   const request: VideoJobRequest = {
     title: script.title.slice(0, 160) || "Untitled video",
     script: script.content,
@@ -59,6 +91,7 @@ async function queueVideoJob(formData: FormData): Promise<QueueResult> {
     orientation,
     tone: tone ?? (VIDEO_TONES.includes(script.tone) ? script.tone : "conversational"),
     ...parsed.settings,
+    ...(ai ? { ai } : {}),
   };
 
   const { data, error } = await supabase
@@ -76,36 +109,17 @@ async function queueVideoJob(formData: FormData): Promise<QueueResult> {
 
 /** Legacy form action used by the render panel in the script editor. */
 export async function enqueueVideoAction(formData: FormData) {
-  const result = await queueVideoJob(formData);
+  const result = await queueVideoJob(formData, "quick");
   if ("error" in result) throw new Error(result.error);
 }
 
 /** AI Video Studio: queue a job and open its detail page, or return a form error. */
 export async function generateVideoAction(_: ActionState, formData: FormData): Promise<ActionState> {
-  const result = await queueVideoJob(formData);
+  const result = await queueVideoJob(formData, "studio");
   if ("error" in result) {
     return result.field ? { error: result.error, fieldErrors: { [result.field]: result.error } } : { error: result.error };
   }
   redirect(`/videos/${result.id}?queued=1`);
-}
-
-export async function saveProviderCredentialAction(formData: FormData) {
-  const ctx = await getWorkspaceContext();
-  const provider = String(formData.get("provider") ?? "");
-  if (provider !== "anthropic" && provider !== "gemini") throw new Error("Unsupported provider.");
-  const secret = String(formData.get("apiKey") ?? "").trim();
-  if (!secret || secret.length > 500) throw new Error("Enter a valid API key (maximum 500 characters).");
-  const supabase = await createClient();
-  const sealed = encryptSecret(secret);
-  const { error } = await supabase.from("workspace_provider_credentials").upsert({
-    workspace_id: ctx.current.workspace.id,
-    user_id: ctx.user.id,
-    provider,
-    ...sealed,
-  }, { onConflict: "workspace_id,user_id,provider" });
-  if (error) throw new Error(error.message);
-  revalidatePath("/settings/integrations");
-  revalidatePath("/video-studio");
 }
 
 export async function disconnectDriveAction() {

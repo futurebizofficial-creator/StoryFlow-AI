@@ -3,6 +3,7 @@ import { createDecipheriv } from "node:crypto";
 import { mkdir, writeFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { buildEngineJobBody, isUsableThumbnail } from "./engine-request.mjs";
+import { planScenesWithFallback, resolveJobAiPlan, SCENE_SYSTEM_PROMPT } from "./llm-providers.mjs";
 
 const required = ["NEXT_PUBLIC_SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "STORYFLOW_CREDENTIALS_KEY"];
 for (const name of required) if (!process.env[name]) throw new Error(`${name} is required by the video worker`);
@@ -32,7 +33,11 @@ async function update(id, fields) {
 async function jsonFetch(url, options = {}) {
   const res = await fetch(url, { ...options, cache: "no-store", signal: AbortSignal.timeout(60_000) });
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(json.error?.message || `Upstream request failed (${res.status})`);
+  if (!res.ok) {
+    const err = new Error(json.error?.message || `Upstream request failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
   return json;
 }
 function engine(name) {
@@ -49,16 +54,30 @@ function privateHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-async function createClaudeSceneScript(job, apiKey) {
-  const response = await jsonFetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: process.env.CLAUDE_MODEL || "claude-sonnet-4-5", max_tokens: 1800,
-      system: "You are a video production assistant. Preserve the user's meaning and wording. Return a concise visual bible (one recurring character description) followed by the original script with one [Visual: ...] cue per scene. Do not add claims or instructions outside the script.",
-      messages: [{ role: "user", content: `Title: ${job.request.title}\nTone: ${job.request.tone || "conversational"}\nTarget duration: ${job.request.targetDuration || 60} seconds\n\nScript:\n${job.request.script}` }],
-    }),
+/** Scene planning with the job's configured AI providers (Claude only for older jobs). */
+async function createSceneScript(job, plan) {
+  const disabled = new Set();
+  if (plan.legacy) {
+    // A job without a provider plan uses Claude (paid). Refuse it in Free Mode workspaces,
+    // e.g. if a request was written directly through the API without a plan.
+    const { data: settings, error } = await db.from("workspace_generation_settings").select("free_mode").eq("workspace_id", job.workspace_id).maybeSingle();
+    if (error) throw error;
+    if (settings?.free_mode) throw new Error("Free Mode is on for this workspace, so this render cannot use Claude (paid). Generation stopped.");
+  } else {
+    const { data, error } = await db.from("workspace_integrations").select("provider").eq("workspace_id", job.workspace_id).eq("enabled", false);
+    if (error) throw error;
+    for (const row of data ?? []) disabled.add(row.provider);
+  }
+  const user = `Title: ${job.request.title}\nTone: ${job.request.tone || "conversational"}\nTarget duration: ${job.request.targetDuration || 60} seconds\n\nScript:\n${job.request.script}`;
+  const { text } = await planScenesWithFallback({
+    plan,
+    system: SCENE_SYSTEM_PROMPT,
+    user,
+    getKey: (id) => providerKey(job, id),
+    isDisabled: (id) => disabled.has(id),
+    defaultClaudeModel: process.env.CLAUDE_MODEL || "claude-sonnet-4-5",
   });
-  return response.content?.filter((part) => part.type === "text").map((part) => part.text).join("\n").slice(0, 4900) || job.request.script;
+  return text.slice(0, 4900) || job.request.script;
 }
 
 async function generateGeminiReference(job, apiKey) {
@@ -163,15 +182,23 @@ async function driveUpload(job, bytes) {
 
 async function processJob(job) {
   try {
-    // Reject invalid render settings before spending the user's Claude/Gemini quota.
+    // Reject invalid render or provider settings before spending any of the user's AI quota.
     buildEngineJobBody(job.request, "");
-    const claudeKey = await providerKey(job, "anthropic");
+    const plan = resolveJobAiPlan(job.request);
     const geminiKey = await providerKey(job, "gemini");
-    if (!claudeKey || !geminiKey) throw new Error("Save your own Claude and Gemini API keys in Integrations before rendering.");
+    if (!geminiKey) throw new Error("Save your own Gemini API key in Integrations before rendering (it creates the character reference).");
     await update(job.id, { stage: "orchestrating", progress: 5 });
-    const script = await createClaudeSceneScript(job, claudeKey);
+    const script = await createSceneScript(job, plan);
     await update(job.id, { stage: "generating_character_reference", progress: 12 });
-    const reference = await generateGeminiReference(job, geminiKey);
+    let reference;
+    try {
+      reference = await generateGeminiReference(job, geminiKey);
+    } catch (err) {
+      if (err?.status === 429 || err?.status === 402) {
+        throw new Error("Gemini quota exhausted while creating the character reference (" + err.status + "). Generation stopped; no other provider was used.");
+      }
+      throw err;
+    }
     const referencePath = `${job.workspace_id}/${job.id}/character-reference.${reference.mime === "image/jpeg" ? "jpg" : "png"}`;
     const { error: referenceError } = await db.storage.from("storyflow-videos").upload(referencePath, reference.bytes, { contentType: reference.mime, upsert: true });
     if (referenceError) throw referenceError;
