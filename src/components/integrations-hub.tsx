@@ -1,12 +1,14 @@
 "use client";
 
-import { startTransition, useActionState, useState, useTransition } from "react";
+import { startTransition, useActionState, useEffect, useState, useTransition } from "react";
 import {
+  listProviderModelsAction,
   removeProviderKeyAction,
   saveGenerationSettingsAction,
   saveProviderKeyAction,
   setProviderEnabledAction,
   testProviderAction,
+  testProviderModelAction,
 } from "@/actions/integrations-hub";
 import { disconnectDriveAction } from "@/actions/video";
 import { Badge, buttonClass, Card, Field, Input, Select } from "@/components/ui";
@@ -408,36 +410,17 @@ function GenerationSettingsPanel({
         {chosen.length > 0 && (
           <div className="grid gap-3 md:grid-cols-2">
             {chosen.map((id) => (
-              <Field
+              <ModelPicker
                 key={id}
-                label={`${name(id)} model`}
-                htmlFor={`model_${id}`}
-                hint={
-                  id === "anthropic"
-                    ? "Optional — defaults to the worker's CLAUDE_MODEL."
-                    : models[id]?.length
-                      ? `${models[id].length} models from your connection test.`
-                      : "Required. Run Test connection on the card to list models."
-                }
+                provider={id}
+                providerName={name(id)}
+                connected={keys.has(id)}
+                value={modelValues[id] ?? ""}
+                onChange={(v) => setModelValues((m) => ({ ...m, [id]: v }))}
+                disabled={!canManage}
                 error={state.fieldErrors?.[`model_${id}`]}
-              >
-                <Input
-                  id={`model_${id}`}
-                  list={`models-${id}`}
-                  value={modelValues[id] ?? ""}
-                  onChange={(e) => setModelValues((m) => ({ ...m, [id]: e.target.value }))}
-                  disabled={!canManage}
-                  maxLength={128}
-                  spellCheck={false}
-                  autoComplete="off"
-                  placeholder="Model id"
-                />
-                <datalist id={`models-${id}`}>
-                  {(models[id] ?? []).map((m) => (
-                    <option key={m} value={m} />
-                  ))}
-                </datalist>
-              </Field>
+                prefetched={models[id]}
+              />
             ))}
           </div>
         )}
@@ -459,5 +442,115 @@ function GenerationSettingsPanel({
         </p>
       </form>
     </Card>
+  );
+}
+
+/**
+ * Model selector backed by the provider's live model list (fetched server-side with the user's
+ * own key and filtered to text-generation models). No model names are hard-coded; a saved model
+ * that is no longer offered is shown as unavailable instead of being silently kept or replaced.
+ */
+function ModelPicker({
+  provider,
+  providerName,
+  connected,
+  value,
+  onChange,
+  disabled,
+  error,
+  prefetched,
+}: {
+  provider: string;
+  providerName: string;
+  connected: boolean;
+  value: string;
+  onChange: (value: string) => void;
+  disabled: boolean;
+  error?: string;
+  prefetched?: string[];
+}) {
+  const [list, setList] = useState<{ status: "idle" | "loading" | "ok" | "error"; models: string[]; error?: string }>(
+    prefetched?.length ? { status: "ok", models: prefetched } : { status: "idle", models: [] },
+  );
+  const [loading, startLoading] = useTransition();
+  const [testing, startTesting] = useTransition();
+  const [test, setTest] = useState<{ ok: boolean; message: string; latencyMs?: number } | null>(null);
+  const optional = provider === "anthropic";
+
+  const load = () =>
+    startLoading(async () => {
+      setList((l) => ({ ...l, status: "loading" }));
+      const result = await listProviderModelsAction(provider);
+      setList(result.ok ? { status: "ok", models: result.models } : { status: "error", models: [], error: result.error });
+    });
+
+  useEffect(() => {
+    if (connected && list.status === "idle") load();
+    // Load once per provider when it is chosen.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, provider]);
+
+  const normalized = value.replace(/^models\//, "");
+  const listed = list.status === "ok" && (!normalized || list.models.includes(normalized));
+  const id = `model_${provider}`;
+
+  return (
+    <Field
+      label={`${providerName} model`}
+      htmlFor={id}
+      error={error}
+      hint={
+        !connected
+          ? `Connect ${providerName} to load its models.`
+          : list.status === "ok"
+            ? `${list.models.length} text-generation models available for your key.${optional ? " Optional — blank uses the worker's CLAUDE_MODEL." : ""}`
+            : undefined
+      }
+    >
+      {list.status === "ok" ? (
+        <Select id={id} value={normalized} disabled={disabled} onChange={(e) => { onChange(e.target.value); setTest(null); }}>
+          <option value="">{optional ? "Default (CLAUDE_MODEL)" : "Choose a model…"}</option>
+          {normalized && !list.models.includes(normalized) && (
+            <option value={normalized}>{normalized} — not available for this key</option>
+          )}
+          {list.models.map((m) => (
+            <option key={m} value={m}>{m}</option>
+          ))}
+        </Select>
+      ) : (
+        <Input id={id} value={normalized} readOnly disabled placeholder={list.status === "loading" || loading ? "Loading models…" : "No model list loaded"} />
+      )}
+      {list.status === "error" && (
+        <span className="flex flex-wrap items-center gap-2 text-xs text-danger">
+          Could not load models: {list.error}
+          <button type="button" onClick={load} className="font-medium underline">Retry</button>
+        </span>
+      )}
+      {normalized && list.status === "ok" && !listed && (
+        <span className="text-xs text-danger">
+          &ldquo;{normalized}&rdquo; is not offered to your key (it may be retired or not support text generation). Choose another model.
+        </span>
+      )}
+      {connected && normalized && (
+        <span className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={testing}
+            onClick={() => startTesting(async () => setTest(await testProviderModelAction(provider, normalized)))}
+            className="inline-flex h-7 items-center gap-1.5 rounded-lg border border-border px-2 text-xs font-medium hover:bg-surface-2 disabled:opacity-50"
+            title="Sends one minimal request to this model"
+          >
+            {testing ? <span className="size-3 animate-spin rounded-full border-2 border-current border-r-transparent" aria-hidden="true" /> : <Icon name="activity" size={12} />}
+            Test model
+          </button>
+          {test && (
+            <span role="status" className={cn("text-xs", test.ok ? "text-success" : "text-danger")}>
+              {test.message}
+              {typeof test.latencyMs === "number" ? ` · ${test.latencyMs} ms` : ""}
+            </span>
+          )}
+        </span>
+      )}
+    </Field>
   );
 }

@@ -70,6 +70,28 @@ export function normalizeSettings(row: unknown): GenerationSettings {
   };
 }
 
+/** Gemini list responses use "models/<id>"; requests use "<id>". Mirrors the worker's normalisation. */
+export function normalizeModel(provider: string, model: string): string {
+  const m = model.trim();
+  return getProvider(provider)?.llm?.api === "gemini" ? m.replace(/^models\//, "") : m;
+}
+
+/**
+ * Checks a chosen model against the provider's live model list (fetched with the user's key and
+ * filtered to text-generation models). No model names are hard-coded.
+ */
+export function modelAvailability(provider: string, model: string, liveModels: readonly string[]): { ok: boolean; model: string; message: string | null } {
+  const normalized = normalizeModel(provider, model);
+  const live = new Set(liveModels.map((m) => normalizeModel(provider, m)));
+  if (live.has(normalized)) return { ok: true, model: normalized, message: null };
+  const name = getProvider(provider)?.name ?? provider;
+  return {
+    ok: false,
+    model: normalized,
+    message: `${name} model "${normalized}" is not available for your API key (it may be retired or not support text generation). Choose a model from the list.`,
+  };
+}
+
 /** Whether a provider may be chosen in the settings form, and why not. Mirrors the save rules. */
 export function providerSelectability(
   id: string,

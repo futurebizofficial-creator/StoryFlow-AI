@@ -18,6 +18,7 @@ export function RegenerateVideo({
   settings = [],
   aiProvider,
   paidProviders = [],
+  characterReference = true,
   label = "Generate again",
 }: {
   scriptId: string;
@@ -28,6 +29,8 @@ export function RegenerateVideo({
   aiProvider?: string;
   /** Paid providers the previous render used; regenerating requires confirming paid usage again. */
   paidProviders?: string[];
+  /** Previous Production Setup choice for the character reference step. */
+  characterReference?: boolean;
   label?: string;
 }) {
   const [state, action] = useActionState(generateVideoAction, {} as ActionState);
@@ -42,6 +45,9 @@ export function RegenerateVideo({
         <input key={name} type="hidden" name={name} value={value} />
       ))}
       {aiProvider && <input type="hidden" name="aiProvider" value={aiProvider} />}
+      <input type="hidden" name="characterReference" value={characterReference ? "on" : "off"} />
+      {/* Re-running the same, previously approved Production Setup is the approval; paid use is confirmed below. */}
+      <input type="hidden" name="productionApproved" value="true" />
       {needsConfirm && (
         <label className="flex items-start gap-2 text-xs text-warning">
           <input type="checkbox" checked={confirmed} onChange={(e) => setConfirmed(e.target.checked)} className="mt-0.5 size-3.5 accent-[var(--accent)]" />

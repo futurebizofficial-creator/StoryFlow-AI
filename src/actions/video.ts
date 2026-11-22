@@ -7,7 +7,9 @@ import { getWorkspaceContext } from "@/lib/workspace";
 import { isUuid } from "@/lib/utils";
 import { VIDEO_SCRIPT_MAX, VIDEO_SCRIPT_MIN, VIDEO_TONES } from "@/lib/video/status";
 import { parseRenderSettings } from "@/lib/video/render-settings";
-import { normalizeSettings, resolveScenePlan } from "@/lib/integrations/plan";
+import { modelAvailability, normalizeModel, normalizeSettings, resolveScenePlan } from "@/lib/integrations/plan";
+import { listGenerationModels } from "@/lib/integrations/model-check";
+import { decryptSecret } from "@/lib/video/crypto";
 import type { ActionState, VideoJobRequest } from "@/lib/types";
 
 type QueueResult = { id: string } | { error: string; field?: string };
@@ -64,6 +66,18 @@ async function queueVideoJob(formData: FormData, mode: "studio" | "quick"): Prom
   // to Claude (paid) instead of the provider the workspace actually saved.
   const readError = settingsError ?? keysError ?? disabledError;
   if (readError) return { error: `Could not load AI provider settings: ${readError.message}`, field: "aiProvider" };
+
+  // Production Setup: Studio renders run only with an approved setup. The character reference
+  // task can be skipped (saves Gemini quota); quick renders keep the original behaviour (on).
+  const refRaw = formData.get("characterReference");
+  if (refRaw !== null && refRaw !== "on" && refRaw !== "off") return { error: "Choose a valid character reference option.", field: "aiProvider" };
+  const characterReference = refRaw !== "off";
+  if (mode === "studio" && formData.get("productionApproved") !== "true") {
+    return { error: "Review and approve the Production Setup before generating.", field: "productionApproved" };
+  }
+  if (characterReference && !(keyRows ?? []).some((r) => r.provider === "gemini")) {
+    return { error: "The character reference uses Google Gemini, but no Gemini key is saved. Connect Gemini or skip the character reference.", field: "aiProvider" };
+  }
   let ai: VideoJobRequest["ai"];
   if (mode === "studio" || settingsRow) {
     const settings = normalizeSettings(settingsRow);
@@ -81,8 +95,41 @@ async function queueVideoJob(formData: FormData, mode: "studio" | "quick"): Prom
         ? { error: "This render can use a paid AI provider. Confirm paid usage to continue.", field: "paidAcknowledged" }
         : { error: "This workspace's AI providers include a paid provider. Use AI Video Studio to confirm paid usage." };
     }
+    // Verify each planned model against the provider's live list for this user's key before
+    // queueing, so a retired or unsupported model fails here with a clear message instead of a
+    // 404 inside the worker. If a list cannot be fetched (e.g. network), the worker still reports
+    // the exact provider error.
+    const providers: Array<{ id: string; model: string | null }> = [];
+    for (const p of plan.providers) {
+      if (!p.model) {
+        providers.push({ id: p.id, model: null });
+        continue;
+      }
+      const model = normalizeModel(p.id, p.model);
+      const { data: cred } = await supabase
+        .from("workspace_provider_credentials")
+        .select("ciphertext,nonce,auth_tag")
+        .eq("workspace_id", ctx.current.workspace.id)
+        .eq("user_id", ctx.user.id)
+        .eq("provider", p.id)
+        .maybeSingle();
+      if (cred) {
+        let key: string | null = null;
+        try {
+          key = decryptSecret(cred);
+        } catch {}
+        if (key) {
+          const live = await listGenerationModels(p.id, key);
+          if (live.ok) {
+            const availability = modelAvailability(p.id, model, live.models);
+            if (!availability.ok) return { error: `${availability.message} Update it in Integrations.`, field: "aiProvider" };
+          }
+        }
+      }
+      providers.push({ id: p.id, model });
+    }
     ai = {
-      providers: plan.providers.map((p) => ({ id: p.id, model: p.model })),
+      providers,
       freeMode: settings.freeMode,
       paidAcknowledged: plan.usesPaid,
     };
@@ -96,6 +143,7 @@ async function queueVideoJob(formData: FormData, mode: "studio" | "quick"): Prom
     tone: tone ?? (VIDEO_TONES.includes(script.tone) ? script.tone : "conversational"),
     ...parsed.settings,
     ...(ai ? { ai } : {}),
+    ...(mode === "studio" ? { characterReference, setupApprovedAt: new Date().toISOString() } : {}),
   };
 
   const { data, error } = await supabase

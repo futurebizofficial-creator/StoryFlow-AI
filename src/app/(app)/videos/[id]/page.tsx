@@ -248,6 +248,7 @@ export default async function VideoDetailPage({
                 />
               )}
               <Row label="Music" value={job.request.backgroundMusic || <span className="text-muted">Automatic</span>} />
+              <Row label="Character reference" value={job.request.characterReference === false ? <span className="text-muted">Skipped</span> : "Google Gemini"} />
               <Row
                 label="AI providers"
                 value={
@@ -276,6 +277,7 @@ export default async function VideoDetailPage({
                     tone={job.request.tone}
                     settings={settingsToFormEntries(job.request)}
                     aiProvider={job.request.ai?.providers[0]?.id}
+                    characterReference={job.request.characterReference !== false}
                     paidProviders={(job.request.ai?.providers ?? [])
                       .filter((p) => getProvider(p.id)?.pricing === "paid")
                       .map((p) => `${getProvider(p.id)?.name ?? p.id} (${PRICING_LABEL.paid})`)}

@@ -17,6 +17,10 @@ import type { VoicePickerGroup } from "@/components/voice-picker";
 import { getProvider } from "@/lib/integrations/catalog";
 import { normalizeSettings, resolveScenePlan } from "@/lib/integrations/plan";
 import type { StudioAiOption } from "@/components/video-studio-form";
+import { analyzeScript } from "@/lib/production/director";
+import { listGenerationModels } from "@/lib/integrations/model-check";
+import { modelAvailability } from "@/lib/integrations/plan";
+import { decryptSecret } from "@/lib/video/crypto";
 
 export const metadata: Metadata = { title: "AI Video Studio" };
 
@@ -78,6 +82,7 @@ export default async function VideoStudioPage({ searchParams }: { searchParams: 
       excerpt: text.slice(0, 280),
       issue,
       updatedAt: s.updated_at,
+      analysis: analyzeScript(s.content),
     };
   });
 
@@ -98,19 +103,57 @@ export default async function VideoStudioPage({ searchParams }: { searchParams: 
   const genSettings = settingsError ? { freeMode: false, aiProviders: [], aiModels: {}, isDefault: false } : normalizeSettings(settingsRes.data);
   const disabledProviders = new Set((disabledRes.data ?? []).map((r) => r.provider));
   // Availability of each configured scene-planning provider for this user (same rules the action enforces).
+  // Integration Validation: for each provider this setup could use, check now (server-side, with
+  // the user's own key) that the key works and the saved model is offered. Listing models is free.
+  const validateIds = Array.from(new Set([...genSettings.aiProviders.filter((id) => providers.has(id)), ...(providers.has("gemini") ? ["gemini"] : [])]));
+  const validation = new Map<string, { ok: boolean; error: string | null }>();
+  if (validateIds.length) {
+    const { data: creds } = await supabase
+      .from("workspace_provider_credentials")
+      .select("provider,ciphertext,nonce,auth_tag")
+      .eq("workspace_id", wsId)
+      .eq("user_id", ctx.user.id)
+      .in("provider", validateIds);
+    await Promise.all(
+      validateIds.map(async (id) => {
+        const cred = (creds ?? []).find((c) => c.provider === id);
+        let key: string | null = null;
+        try {
+          key = cred ? decryptSecret(cred) : null;
+        } catch {}
+        if (!key) return validation.set(id, { ok: false, error: "The saved key could not be read. Save it again in Integrations." });
+        const live = await listGenerationModels(id, key);
+        if (!live.ok) return validation.set(id, { ok: false, error: live.error ?? "Could not verify the key." });
+        const model = genSettings.aiModels[id];
+        if (model && genSettings.aiProviders.includes(id)) {
+          const available = modelAvailability(id, model, live.models);
+          if (!available.ok) return validation.set(id, { ok: false, error: available.message });
+        }
+        validation.set(id, { ok: true, error: null });
+      }),
+    );
+  }
+
   const aiOptions: StudioAiOption[] = genSettings.aiProviders.map((id) => {
     const plan = resolveScenePlan({ settings: genSettings, primary: id, keys: providers, disabled: disabledProviders });
     const def = getProvider(id);
+    const check = validation.get(id);
     return {
       id,
       name: def?.name ?? id,
       pricing: def?.pricing ?? "paid",
       model: genSettings.aiModels[id] ?? null,
       available: plan.ok,
-      reason: plan.ok ? null : plan.error,
-      chain: plan.ok ? plan.providers.map((p) => ({ id: p.id, name: getProvider(p.id)?.name ?? p.id, paid: p.paid })) : [],
+      validated: plan.ok && check?.ok === true,
+      reason: plan.ok ? (check && !check.ok ? check.error : null) : plan.error,
+      chain: plan.ok
+        ? plan.providers
+            .filter((p) => validation.get(p.id)?.ok === true)
+            .map((p) => ({ id: p.id, name: getProvider(p.id)?.name ?? p.id, paid: p.paid }))
+        : [],
     };
   });
+  const gemini = validation.get("gemini");
   const jobs = (jobsRes.data ?? []) as unknown as VideoJobListItem[];
   const initialScriptId = isUuid(requested) && scripts.some((s) => s.id === requested) ? requested : (scripts.find((s) => !s.issue)?.id ?? "");
 
@@ -152,7 +195,15 @@ export default async function VideoStudioPage({ searchParams }: { searchParams: 
           voiceGroups={voiceGroups}
           voiceStatus={voiceCatalog.status}
           readiness={{ gemini: providers.has("gemini"), drive: driveRes.data ? (driveRes.data.email ?? "connected") : null }}
-          ai={{ freeMode: genSettings.freeMode, options: aiOptions, canManage: ctx.canManage, isDefault: genSettings.isDefault === true, loadError: settingsError }}
+          ai={{
+            freeMode: genSettings.freeMode,
+            options: aiOptions,
+            canManage: ctx.canManage,
+            isDefault: genSettings.isDefault === true,
+            loadError: settingsError,
+            geminiValidated: gemini?.ok === true,
+            geminiError: providers.has("gemini") ? (gemini?.error ?? null) : "No Gemini API key saved.",
+          }}
         />
       )}
 

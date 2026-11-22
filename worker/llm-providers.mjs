@@ -21,13 +21,57 @@ export const SCENE_SYSTEM_PROMPT =
 export class AiPlanError extends Error {}
 
 export class ProviderCallError extends Error {
-  /** @param {"quota"|"auth"|"unavailable"|"bad_response"} kind */
-  constructor(provider, kind, message, status) {
+  /**
+   * @param {string} provider
+   * @param {"quota"|"auth"|"unavailable"|"model_unavailable"|"bad_response"} kind
+   * @param {string} message
+   * @param {number} status
+   * @param {string|null} [model]
+   * @param {string|null} [detail]
+   */
+  constructor(provider, kind, message, status, model = null, detail = null) {
     super(message);
     this.provider = provider;
     this.kind = kind;
     this.status = status;
+    this.model = model;
+    this.detail = detail;
   }
+}
+
+/**
+ * Gemini addresses models as "gemini-x"; list responses and some saved values use the
+ * resource name "models/gemini-x". Normalise so the request path is always /models/gemini-x.
+ */
+export function normalizeModelId(id, model) {
+  if (typeof model !== "string") return model;
+  const m = model.trim();
+  return PROVIDERS.get(id)?.llm.api === "gemini" ? m.replace(/^models\//, "") : m;
+}
+
+/**
+ * The provider's own error message (Gemini, OpenAI-compatible and Anthropic all use
+ * error.message), with anything key-like removed and length capped. Never includes the key.
+ */
+export function providerErrorDetail(body) {
+  if (!body || typeof body !== "object") return null;
+  const raw =
+    typeof body.error === "string"
+      ? body.error
+      : typeof body.error?.message === "string"
+        ? body.error.message
+        : typeof body.message === "string"
+          ? body.message
+          : null;
+  if (!raw) return null;
+  return raw
+    .replace(/AIza[0-9A-Za-z_-]{10,}/g, "[redacted]")
+    .replace(/\b(sk|gsk|hf|r8|xai)[-_][A-Za-z0-9_-]{8,}/g, "[redacted]")
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/([?&](key|api_key|token)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 300);
 }
 
 export function providerName(id) {
@@ -69,17 +113,18 @@ export function resolveJobAiPlan(request) {
 }
 
 /** Builds the HTTP request for one provider (no network). */
-export function buildLlmRequest(id, model, apiKey, system, user, defaultClaudeModel) {
+export function buildLlmRequest(id, modelInput, apiKey, system, user, defaultClaudeModel, maxTokens = 1800) {
   const def = PROVIDERS.get(id);
   if (!def) throw new AiPlanError("Unsupported AI provider.");
   const { api, baseUrl } = def.llm;
+  const model = normalizeModelId(id, modelInput);
   if (api === "anthropic") {
     return {
       url: `${baseUrl}/messages`,
       init: {
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model: model || defaultClaudeModel, max_tokens: 1800, system, messages: [{ role: "user", content: user }] }),
+        body: JSON.stringify({ model: model || defaultClaudeModel, max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] }),
       },
     };
   }
@@ -92,7 +137,7 @@ export function buildLlmRequest(id, model, apiKey, system, user, defaultClaudeMo
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: system }] },
           contents: [{ role: "user", parts: [{ text: user }] }],
-          generationConfig: { maxOutputTokens: 1800 },
+          generationConfig: { maxOutputTokens: maxTokens },
         }),
       },
     };
@@ -102,7 +147,7 @@ export function buildLlmRequest(id, model, apiKey, system, user, defaultClaudeMo
     init: {
       method: "POST",
       headers: { "content-type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, max_tokens: 1800, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
     },
   };
 }
@@ -125,16 +170,24 @@ export function parseLlmText(id, body) {
 export function classifyStatus(status) {
   if (status === 429 || status === 402) return "quota";
   if (status === 401 || status === 403) return "auth";
+  if (status === 404) return "model_unavailable";
   if (status >= 500 || status === 408) return "unavailable";
   return "bad_response";
 }
 
-function describe(err) {
+/** "Google Gemini (model gemini-x): model not found or not available for this key (404) — <provider message>" */
+export function describeProviderError(err) {
   const name = providerName(err.provider);
-  if (err.kind === "quota") return `${name}: quota or credits exhausted (${err.status})`;
-  if (err.kind === "auth") return `${name}: key rejected (${err.status})`;
-  if (err.kind === "unavailable") return `${name}: ${err.message}`;
-  return `${name}: ${err.message}`;
+  const who = err.model ? `${name} (model ${err.model})` : name;
+  const what =
+    err.kind === "quota"
+      ? `quota or credits exhausted (${err.status})`
+      : err.kind === "auth"
+        ? `key rejected (${err.status})`
+        : err.kind === "model_unavailable"
+          ? `model not found or not available for this API key (${err.status})`
+          : err.message;
+  return `${who}: ${what}${err.detail ? ` — ${err.detail}` : ""}`;
 }
 
 /**
@@ -159,20 +212,23 @@ export async function planScenesWithFallback(options) {
       failures.push(`${providerName(provider.id)}: no API key saved`);
       continue;
     }
+    const model = normalizeModelId(provider.id, provider.model) || (provider.id === "anthropic" ? defaultClaudeModel : null);
     const { url, init } = buildLlmRequest(provider.id, provider.model, key, system, user, defaultClaudeModel);
     try {
       let res;
       try {
         res = await fetchImpl(url, { ...init, cache: "no-store", redirect: "error", signal: AbortSignal.timeout(options.timeoutMs ?? 90_000) });
       } catch {
-        throw new ProviderCallError(provider.id, "unavailable", "network error or timeout", 0);
+        throw new ProviderCallError(provider.id, "unavailable", "network error or timeout", 0, model);
       }
       const body = await res.json().catch(() => null);
-      if (!res.ok) throw new ProviderCallError(provider.id, classifyStatus(res.status), `request failed (${res.status})`, res.status);
-      return { text: parseLlmText(provider.id, body), provider: provider.id };
+      if (!res.ok) {
+        throw new ProviderCallError(provider.id, classifyStatus(res.status), `request failed (${res.status})`, res.status, model, providerErrorDetail(body));
+      }
+      return { text: parseLlmText(provider.id, body), provider: provider.id, model };
     } catch (err) {
       if (!(err instanceof ProviderCallError)) throw err;
-      failures.push(describe(err));
+      failures.push(describeProviderError(err));
     }
   }
   const prefix = plan.freeMode

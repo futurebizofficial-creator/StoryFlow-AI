@@ -17,6 +17,7 @@ import {
 } from "@/lib/video/render-settings";
 import { VoicePicker, type VoicePickerGroup } from "@/components/voice-picker";
 import type { ActionState } from "@/lib/types";
+import { recommendProduction, type ScriptAnalysis, type TaskRecommendation } from "@/lib/production/director";
 
 export interface StudioScript {
   id: string;
@@ -29,6 +30,7 @@ export interface StudioScript {
   excerpt: string;
   issue: string | null;
   updatedAt: string;
+  analysis: ScriptAnalysis;
 }
 
 const ORIENTATIONS = [
@@ -44,6 +46,8 @@ export interface StudioAiOption {
   pricing: "free" | "free_tier" | "paid";
   model: string | null;
   available: boolean;
+  /** Integration Validation passed: key works now and the model is in the live list. */
+  validated: boolean;
   reason: string | null;
   /** Providers tried in order when this one is the primary (only configured, available ones). */
   chain: Array<{ id: string; name: string; paid: boolean }>;
@@ -68,6 +72,8 @@ export function VideoStudioForm({
     isDefault?: boolean;
     /** Database error while loading saved settings. */
     loadError?: string | null;
+    geminiValidated: boolean;
+    geminiError: string | null;
   };
   voiceGroups: VoicePickerGroup[] | null;
   voiceStatus: "ok" | "unconfigured" | "unavailable";
@@ -87,18 +93,38 @@ export function VideoStudioForm({
   const selected = useMemo(() => scripts.find((s) => s.id === scriptId), [scripts, scriptId]);
   const [tone, setTone] = useState(selected && VIDEO_TONES.includes(selected.tone) ? selected.tone : "conversational");
 
-  const [aiProvider, setAiProvider] = useState(() => ai.options.find((o) => o.available)?.id ?? "");
-  const [paidConfirmed, setPaidConfirmed] = useState(false);
-  const aiChoice = ai.options.find((o) => o.id === aiProvider);
+  // AI Production Director: recommendation for the selected script from verified providers only.
+  const recommendation = useMemo(
+    () =>
+      selected
+        ? recommendProduction({
+            analysis: selected.analysis,
+            scenePlanners: ai.options.map((o) => ({ id: o.id, name: o.name, pricing: o.pricing, available: o.available, validated: o.validated, reason: o.reason, model: o.model })),
+            geminiValidated: ai.geminiValidated,
+            freeMode: ai.freeMode,
+          })
+        : null,
+    [selected, ai.options, ai.geminiValidated, ai.freeMode],
+  );
+  // null = follow the recommendation; any user change is kept and must be approved again.
+  const [aiProvider, setAiProvider] = useState<string | null>(null);
+  const [characterRef, setCharacterRef] = useState<boolean | null>(null);
+  const [approved, setApproved] = useState(false);
+  const effectiveAi = aiProvider ?? recommendation?.scenePlanning.value ?? "";
+  const effectiveRef = characterRef ?? recommendation?.characterReference.value ?? false;
+  const aiChoice = ai.options.find((o) => o.id === effectiveAi);
   const usesPaid = Boolean(aiChoice?.chain.some((p) => p.paid));
-  const aiReady = Boolean(aiChoice?.available);
-  const keysReady = aiReady && readiness.gemini;
-  const canGenerate = Boolean(selected && !selected.issue && keysReady && (!usesPaid || paidConfirmed));
+  const aiReady = Boolean(aiChoice?.validated);
+  const referenceReady = !effectiveRef || ai.geminiValidated;
+  const keysReady = aiReady && referenceReady;
+  const canGenerate = Boolean(selected && !selected.issue && keysReady && approved);
 
   const chooseScript = (id: string) => {
     setScriptId(id);
     const next = scripts.find((s) => s.id === id);
     if (next) setTone(VIDEO_TONES.includes(next.tone) ? next.tone : "conversational");
+    // A different script gets a fresh recommendation, which must be approved again.
+    setApproved(false);
   };
 
   return (
@@ -264,17 +290,17 @@ export function VideoStudioForm({
           </div>
         </Card>
 
-        {/* 4. AI scene planning */}
+        {/* 4. Production Setup (AI Production Director → approval) */}
         <Card>
           <div className="flex items-center gap-3 border-b border-border px-5 py-4">
             <StepNumber n={4} />
             <div className="min-w-0 flex-1">
-              <h2 className="text-[15px] font-semibold tracking-tight">AI scene planning</h2>
-              <p className="text-[13px] text-muted">Turns your script into scenes and visual cues. Uses your own API key.</p>
+              <h2 className="text-[15px] font-semibold tracking-tight">Production Setup</h2>
+              <p className="text-[13px] text-muted">The AI Production Director recommends a provider per task. Review, change, then approve.</p>
             </div>
             <Badge tone={ai.freeMode ? "success" : "neutral"} dot>{ai.freeMode ? "Free Mode on" : "Free Mode off"}</Badge>
           </div>
-          <div className="space-y-3 p-5">
+          <div className="space-y-4 p-5">
             {ai.loadError && (
               <p role="alert" className="rounded-lg bg-danger-soft px-3 py-2 text-xs text-danger">
                 AI provider settings could not be loaded: {ai.loadError}
@@ -282,38 +308,86 @@ export function VideoStudioForm({
             )}
             {ai.isDefault && !ai.loadError && (
               <p className="rounded-lg bg-surface-2 px-3 py-2 text-xs text-muted">
-                This workspace has not saved AI provider settings yet, so renders use Anthropic Claude (Paid). Choose free
+                This workspace has not saved AI provider settings yet, so scene planning uses Anthropic Claude (Paid). Choose free
                 providers in Integrations.
               </p>
             )}
-            {!ai.loadError && ai.options.length === 0 && (
-              <p className="rounded-lg bg-warning-soft px-3 py-2 text-xs text-warning">No AI providers are configured for this workspace.</p>
+
+            {selected && (
+              <div className="grid grid-cols-2 gap-2 rounded-xl border border-border bg-surface-2/50 p-3 text-xs sm:grid-cols-4">
+                <AnalysisStat label="Scenes" value={String(selected.analysis.scenes)} />
+                <AnalysisStat label="Narration" value={formatDuration(selected.analysis.estimatedSeconds)} />
+                <AnalysisStat label="Language" value={WRITING_LABEL[selected.analysis.writingSystem]} />
+                <AnalysisStat label="Recurring character" value={selected.analysis.recurringCharacter ? (selected.analysis.characterHint ?? "Yes") : "No"} />
+              </div>
             )}
-            <Field
-              label="Primary provider"
-              htmlFor="aiProvider"
-              error={err.aiProvider}
-              hint={aiChoice?.available ? undefined : (aiChoice?.reason ?? "Configure providers in Integrations.")}
-            >
-              <Select id="aiProvider" name="aiProvider" value={aiProvider} onChange={(e) => { setAiProvider(e.target.value); setPaidConfirmed(false); }}>
-                <option value="" disabled>Choose a provider…</option>
-                {ai.options.map((o) => (
-                  <option key={o.id} value={o.id} disabled={!o.available}>
-                    {o.name}{o.model ? ` · ${o.model}` : ""} · {o.pricing === "paid" ? "Paid" : o.pricing === "free" ? "Free" : "Free tier"}{o.available ? "" : " · unavailable"}
+
+            <div className="divide-y divide-border rounded-xl border border-border">
+              {/* Scene planning: real choice among verified providers */}
+              <TaskRow
+                task="Scene planning"
+                description="Writes scenes and visual cues from your script."
+                recommended={recommendation?.scenePlanning}
+                recommendedLabel={ai.options.find((o) => o.id === recommendation?.scenePlanning.value)?.name}
+                overridden={aiProvider !== null && aiProvider !== recommendation?.scenePlanning.value}
+              >
+                <Select
+                  id="aiProviderSelect"
+                  aria-label="Scene planning provider"
+                  value={effectiveAi}
+                  onChange={(e) => { setAiProvider(e.target.value); setApproved(false); }}
+                >
+                  <option value="" disabled>Choose a provider…</option>
+                  {ai.options.map((o) => (
+                    <option key={o.id} value={o.id} disabled={!o.validated}>
+                      {o.name}{o.model ? ` · ${o.model}` : ""} · {o.pricing === "paid" ? "Paid" : o.pricing === "free" ? "Free" : "Free tier"}
+                      {o.validated ? " · verified" : ` · ${o.available ? "not verified" : "unavailable"}`}
+                    </option>
+                  ))}
+                </Select>
+                {aiChoice && !aiChoice.validated && aiChoice.reason && <p className="mt-1 text-xs text-danger">{aiChoice.reason}</p>}
+                {err.aiProvider && <p className="mt-1 text-xs text-danger">{err.aiProvider}</p>}
+                {aiChoice?.validated && (
+                  <p className="mt-1 text-xs text-muted">
+                    {aiChoice.chain.length > 1
+                      ? `Fallback if it fails: ${aiChoice.chain.slice(1).map((p) => `${p.name}${p.paid ? " (paid)" : ""}`).join(" → ")}. No other provider is used.`
+                      : "No fallback; if it fails the render stops with the provider's exact error."}
+                  </p>
+                )}
+              </TaskRow>
+
+              {/* Character reference: Gemini or skipped */}
+              <TaskRow
+                task="Character reference"
+                description="A reference image that keeps a recurring character consistent."
+                recommended={recommendation ? { value: recommendation.characterReference.value, reason: recommendation.characterReference.reason } : undefined}
+                recommendedLabel={recommendation?.characterReference.value ? "Google Gemini" : "Skip"}
+                overridden={characterRef !== null && characterRef !== recommendation?.characterReference.value}
+              >
+                <Select
+                  id="characterReferenceSelect"
+                  aria-label="Character reference provider"
+                  value={effectiveRef ? "on" : "off"}
+                  onChange={(e) => { setCharacterRef(e.target.value === "on"); setApproved(false); }}
+                >
+                  <option value="on" disabled={!ai.geminiValidated}>
+                    Google Gemini · Free tier{ai.geminiValidated ? " · verified" : " · unavailable"}
                   </option>
-                ))}
-              </Select>
-            </Field>
-            {aiChoice?.available && aiChoice.chain.length > 1 && (
-              <p className="text-xs text-muted">
-                If {aiChoice.name} fails or runs out of quota, StoryFlow tries:{" "}
-                {aiChoice.chain.slice(1).map((p) => `${p.name}${p.paid ? " (paid)" : ""}`).join(" → ")}. No other provider is used.
-              </p>
-            )}
-            {aiChoice?.available && aiChoice.chain.length === 1 && (
-              <p className="text-xs text-muted">No fallback is configured; if this provider fails, the render stops with an error.</p>
-            )}
+                  <option value="off">Skip (no reference image)</option>
+                </Select>
+                {!ai.geminiValidated && ai.geminiError && <p className="mt-1 text-xs text-muted">{ai.geminiError}</p>}
+              </TaskRow>
+
+              {/* Engine-owned tasks: shown for transparency, not selectable */}
+              <FixedTaskRow task="Narration" provider="Render engine voices (Edge-TTS) · Free" note={recommendation?.narration ?? "Choose a voice in the Voice step."} />
+              <FixedTaskRow task="Subtitles & music" provider="Render engine · Free" note="Styled in the Subtitles and Music steps." />
+              <FixedTaskRow task="Stock footage" provider="Render engine's own stock sources" note="Choosing Pexels, Pixabay or other libraries for renders is not supported by the engine yet." />
+              <FixedTaskRow task="Rendering" provider="Automated Video Generator" note="Rendering and hosting costs are separate from AI provider usage." />
+              <FixedTaskRow task="Quality review" provider="Agentic Video analyze.video" note="Runs after rendering when the quality service is configured on the worker." />
+            </div>
+
             <p className="text-xs text-muted">
+              Only connected providers whose key and model passed a live check are offered.{" "}
               {ai.canManage ? "Change providers, models, fallbacks and Free Mode in " : "Owners and admins manage providers and Free Mode in "}
               <Link href="/settings/integrations#ai" className="font-medium text-accent hover:underline">Integrations</Link>.
             </p>
@@ -499,8 +573,8 @@ export function VideoStudioForm({
             </div>
 
             <div className="space-y-2 text-[13px]">
-              <Requirement ok={aiReady} label={aiChoice ? `AI provider: ${aiChoice.name}` : "AI provider"} href="/settings/integrations#ai" />
-              <Requirement ok={readiness.gemini} label="Gemini API key" href="/settings/integrations" />
+              <Requirement ok={aiReady} label={aiChoice ? `Scene planning: ${aiChoice.name} (verified)` : "Scene planning provider"} href="/settings/integrations#ai" />
+              {effectiveRef && <Requirement ok={ai.geminiValidated} label="Character reference: Gemini (verified)" href="/settings/integrations#ai" />}
               <Requirement ok={Boolean(selected && !selected.issue)} label="Renderable script" />
               <div className="flex items-center justify-between gap-2 rounded-lg px-1 py-1">
                 <span className="flex items-center gap-2 text-fg-2">
@@ -512,22 +586,30 @@ export function VideoStudioForm({
 
             {!keysReady && (
               <Alert tone="warning" title="Finish AI setup">
-                Video generation uses your own keys: an available AI provider for scene planning and Gemini for the character
-                reference. Set them up in{" "}
+                Production Setup needs a verified AI provider for scene planning{effectiveRef ? " and a verified Gemini key for the character reference" : ""}. Set them up in{" "}
                 <Link href="/settings/integrations" className="font-medium underline">Integrations</Link>.
               </Alert>
             )}
 
-            {usesPaid && (
-              <label className="flex items-start gap-2 rounded-lg bg-warning-soft px-3 py-2 text-xs text-warning">
-                <input type="checkbox" checked={paidConfirmed} onChange={(e) => setPaidConfirmed(e.target.checked)} className="mt-0.5 size-3.5 accent-[var(--accent)]" />
-                <span>
-                  This render may use a paid provider ({aiChoice?.chain.filter((p) => p.paid).map((p) => p.name).join(", ")}). Charges go to
-                  your own API account. I confirm paid usage.
-                </span>
-                {paidConfirmed && <input type="hidden" name="paidAcknowledged" value="true" />}
-              </label>
-            )}
+            <input type="hidden" name="aiProvider" value={effectiveAi} />
+            <input type="hidden" name="characterReference" value={effectiveRef ? "on" : "off"} />
+            <label className={cn("flex items-start gap-2 rounded-lg px-3 py-2 text-xs", usesPaid ? "bg-warning-soft text-warning" : "bg-surface-2 text-fg-2")}>
+              <input
+                type="checkbox"
+                checked={approved}
+                disabled={!keysReady}
+                onChange={(e) => setApproved(e.target.checked)}
+                className="mt-0.5 size-3.5 accent-[var(--accent)]"
+              />
+              <span>
+                I approve this production setup: scene planning with {aiChoice?.name ?? "—"}
+                {effectiveRef ? ", character reference with Google Gemini" : ", no character reference"}.
+                {usesPaid && ` This includes a paid provider (${aiChoice?.chain.filter((p) => p.paid).map((p) => p.name).join(", ")}); charges go to your own API account.`}
+              </span>
+              {approved && <input type="hidden" name="productionApproved" value="true" />}
+              {approved && usesPaid && <input type="hidden" name="paidAcknowledged" value="true" />}
+            </label>
+            {err.productionApproved && <p className="text-xs text-danger">{err.productionApproved}</p>}
 
             <FormMessage state={state} />
 
@@ -595,6 +677,71 @@ function Requirement({ ok, label, href }: { ok: boolean; label: string; href?: s
       ) : (
         <span className="text-xs text-warning">Missing</span>
       )}
+    </div>
+  );
+}
+
+const WRITING_LABEL: Record<ScriptAnalysis["writingSystem"], string> = {
+  latin: "Latin script",
+  arabic: "Arabic script",
+  devanagari: "Devanagari",
+  cjk: "Chinese/Japanese/Korean",
+  cyrillic: "Cyrillic",
+  other: "Unknown",
+};
+
+function AnalysisStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-muted">{label}</p>
+      <p className="truncate font-medium">{value}</p>
+    </div>
+  );
+}
+
+function TaskRow({
+  task,
+  description,
+  recommended,
+  recommendedLabel,
+  overridden,
+  children,
+}: {
+  task: string;
+  description: string;
+  recommended?: TaskRecommendation<string | null> | TaskRecommendation<boolean>;
+  recommendedLabel?: string;
+  overridden: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="grid gap-2 p-4 sm:grid-cols-[180px_minmax(0,1fr)]">
+      <div>
+        <p className="text-[13px] font-semibold">{task}</p>
+        <p className="text-xs text-muted">{description}</p>
+      </div>
+      <div className="space-y-1">
+        {children}
+        {recommended && (
+          <p className="flex flex-wrap items-center gap-1.5 text-xs text-muted">
+            <Badge tone={overridden ? "neutral" : "accent"}>{overridden ? "Changed by you" : "Recommended"}</Badge>
+            {recommendedLabel ? <span className="font-medium text-fg-2">Director: {recommendedLabel}.</span> : null}
+            <span>{recommended.reason}</span>
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FixedTaskRow({ task, provider, note }: { task: string; provider: string; note: string }) {
+  return (
+    <div className="grid gap-1 p-4 sm:grid-cols-[180px_minmax(0,1fr)]">
+      <p className="text-[13px] font-semibold">{task}</p>
+      <div>
+        <p className="text-[13px] text-fg-2">{provider}</p>
+        <p className="text-xs text-muted">{note}</p>
+      </div>
     </div>
   );
 }

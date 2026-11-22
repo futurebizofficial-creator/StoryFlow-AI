@@ -5,7 +5,8 @@ import { createClient } from "@/lib/supabase/server";
 import { getWorkspaceContext } from "@/lib/workspace";
 import { encryptSecret, decryptSecret } from "@/lib/video/crypto";
 import { getProvider, isKeyProvider, PROVIDERS } from "@/lib/integrations/catalog";
-import { MAX_AI_PROVIDERS, validateGenerationSettings } from "@/lib/integrations/plan";
+import { MAX_AI_PROVIDERS, MODEL_PATTERN, modelAvailability, validateGenerationSettings } from "@/lib/integrations/plan";
+import { listGenerationModels, testModelGeneration, type ModelListResult, type ModelTestResult } from "@/lib/integrations/model-check";
 import { testProviderConnection, type TestResult } from "@/lib/integrations/testers";
 import type { ActionState } from "@/lib/types";
 
@@ -121,6 +122,22 @@ export async function saveGenerationSettingsAction(_: ActionState, formData: For
   });
   if (!checked.ok) return checked.field ? { error: checked.error, fieldErrors: { [checked.field]: checked.error } } : { error: checked.error };
 
+  // Every chosen model must be in the provider's live list for the saver's key (no guessed or
+  // retired model ids such as one that returns 404 at generation time).
+  for (const [id, model] of Object.entries(checked.models)) {
+    const name = getProvider(id)?.name ?? id;
+    const { key, error: keyError } = await readOwnKey(id);
+    if (!key) return { error: `Could not verify the ${name} model: ${keyError}`, fieldErrors: { [`model_${id}`]: keyError ?? "No key." } };
+    const live = await listGenerationModels(id, key);
+    if (!live.ok) {
+      const msg = `Could not load ${name} models to verify "${model}": ${live.error}`;
+      return { error: msg, fieldErrors: { [`model_${id}`]: msg } };
+    }
+    const availability = modelAvailability(id, model, live.models);
+    if (!availability.ok) return { error: availability.message ?? "Model unavailable.", fieldErrors: { [`model_${id}`]: availability.message ?? "" } };
+    checked.models[id] = availability.model;
+  }
+
   const { error } = await supabase.from("workspace_generation_settings").upsert(
     { workspace_id: wsId, free_mode: freeMode, ai_providers: checked.providers, ai_models: checked.models, updated_by: ctx.user.id },
     { onConflict: "workspace_id" },
@@ -128,4 +145,41 @@ export async function saveGenerationSettingsAction(_: ActionState, formData: For
   if (error) return { error: `Could not save generation settings: ${error.message}` };
   refresh();
   return { success: "Generation settings saved." };
+}
+
+async function readOwnKey(provider: string): Promise<{ key: string | null; error?: string }> {
+  const ctx = await getWorkspaceContext();
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("workspace_provider_credentials")
+    .select("ciphertext,nonce,auth_tag")
+    .eq("workspace_id", ctx.current.workspace.id)
+    .eq("user_id", ctx.user.id)
+    .eq("provider", provider)
+    .maybeSingle();
+  if (error) return { key: null, error: `Could not read the saved key: ${error.message}` };
+  if (!data) return { key: null, error: "Save and test an API key first." };
+  try {
+    return { key: decryptSecret(data) };
+  } catch {
+    return { key: null, error: "The saved key could not be decrypted. Save it again." };
+  }
+}
+
+/** Live model list (text-generation capable) for the model selector, using the caller's key. */
+export async function listProviderModelsAction(provider: string): Promise<ModelListResult> {
+  if (!getProvider(provider)?.llm) return { ok: false, models: [], error: "Not a language-model provider." };
+  const { key, error } = await readOwnKey(provider);
+  if (!key) return { ok: false, models: [], error };
+  return listGenerationModels(provider, key);
+}
+
+/** One minimal generation request against the selected model (only when the user clicks Test model). */
+export async function testProviderModelAction(provider: string, model: string): Promise<ModelTestResult> {
+  const trimmed = String(model ?? "").trim();
+  if (!getProvider(provider)?.llm) return { ok: false, model: trimmed, message: "Not a language-model provider." };
+  if (!MODEL_PATTERN.test(trimmed)) return { ok: false, model: trimmed, message: "Choose a model first." };
+  const { key, error } = await readOwnKey(provider);
+  if (!key) return { ok: false, model: trimmed, message: error ?? "No key." };
+  return testModelGeneration(provider, trimmed, key);
 }

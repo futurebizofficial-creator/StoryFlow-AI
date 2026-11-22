@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { CATEGORIES, KEY_PROVIDER_IDS, LLM_PROVIDER_IDS, PROVIDERS } from "../src/lib/integrations/catalog.ts";
 import {
   applyFreeModeToOrder,
+  modelAvailability,
+  normalizeModel,
   normalizeSettings,
   providerSelectability,
   resolveScenePlan,
@@ -25,8 +27,12 @@ import {
   AiPlanError,
   buildLlmRequest,
   classifyStatus,
+  describeProviderError,
+  normalizeModelId,
   parseLlmText,
   planScenesWithFallback,
+  ProviderCallError,
+  providerErrorDetail,
   resolveJobAiPlan,
 } from "../worker/llm-providers.mjs";
 
@@ -306,7 +312,7 @@ test("fallback goes only to the next configured provider after quota errors", as
       calls,
     ) as unknown as typeof fetch,
   });
-  assert.deepEqual(result, { text: "planned", provider: "gemini" });
+  assert.deepEqual(result, { text: "planned", provider: "gemini", model: "g" });
   assert.equal(calls.length, 2);
   assert.deepEqual(calls.map((u) => new URL(u).host), ["api.groq.com", "generativelanguage.googleapis.com"], "never calls providers outside the plan");
 });
@@ -324,7 +330,7 @@ test("Free Mode stops with a clear quota message instead of using a paid provide
       defaultClaudeModel: "c",
       fetchImpl: fakeFetch({ "api.groq.com": { status: 429, body: {} } }, calls) as unknown as typeof fetch,
     }),
-    /Free Mode never falls back to paid providers.*Groq: quota or credits exhausted \(429\)/,
+    /Free Mode never falls back to paid providers.*Groq \(model m\): quota or credits exhausted \(429\)/,
   );
   assert.equal(calls.length, 1);
 });
@@ -358,6 +364,95 @@ test("older jobs call Claude only, exactly as before", async () => {
     defaultClaudeModel: "claude-default",
     fetchImpl: fakeFetch({ "api.anthropic.com": { status: 200, body: { content: [{ type: "text", text: "scenes" }] } } }, calls) as unknown as typeof fetch,
   });
-  assert.deepEqual(result, { text: "scenes", provider: "anthropic" });
+  assert.deepEqual(result, { text: "scenes", provider: "anthropic", model: "claude-default" });
   assert.deepEqual(calls, ["https://api.anthropic.com/v1/messages"]);
+});
+
+// ---------------------------------------------------------------------------
+// Regression: Gemini 404 (model not available for the key)
+// ---------------------------------------------------------------------------
+
+const GEMINI_404 = {
+  error: {
+    code: 404,
+    message: "models/gemini-2.5-pro is not found for API version v1beta, or is not supported for generateContent. key=AIzaSyFAKEFAKEFAKEFAKEFAKE",
+    status: "NOT_FOUND",
+  },
+};
+
+test("Gemini model ids are normalised and sent to /models/<id>:generateContent", () => {
+  assert.equal(normalizeModelId("gemini", "models/gemini-x"), "gemini-x");
+  assert.equal(normalizeModelId("groq", "models/keep-me"), "models/keep-me");
+  const req = buildLlmRequest("gemini", "models/gemini-x", "k", "s", "u", "c");
+  assert.equal(req.url, "https://generativelanguage.googleapis.com/v1beta/models/gemini-x:generateContent");
+  const small = buildLlmRequest("gemini", "gemini-x", "k", "s", "u", "c", 16);
+  assert.equal(JSON.parse(small.init.body).generationConfig.maxOutputTokens, 16);
+  assert.equal(normalizeModel("gemini", " models/gemini-x "), "gemini-x");
+});
+
+test("404 is reported as model unavailable with the model id and the provider's own message (key redacted)", () => {
+  assert.equal(classifyStatus(404), "model_unavailable");
+  const detail = providerErrorDetail(GEMINI_404);
+  assert.match(detail ?? "", /models\/gemini-2\.5-pro is not found for API version v1beta/);
+  assert.doesNotMatch(detail ?? "", /AIza/);
+  const message = describeProviderError(new ProviderCallError("gemini", "model_unavailable", "request failed (404)", 404, "gemini-2.5-pro", detail));
+  assert.match(message, /^Google Gemini \(model gemini-2\.5-pro\): model not found or not available for this API key \(404\) — models\/gemini-2\.5-pro is not found/);
+  assert.equal(providerErrorDetail({ error: { message: "Bearer abc.def and sk-ant-REALLOOKINGKEY123 and ?key=secret" } }), "Bearer [redacted] and [redacted] and ?key=[redacted]");
+  assert.equal(providerErrorDetail(null), null);
+});
+
+test("Free Mode: after a Gemini 404 only other configured free providers are tried — never Claude", async () => {
+  const calls: string[] = [];
+  const plan = resolveJobAiPlan({ ai: { providers: [{ id: "gemini", model: "gemini-2.5-pro" }, { id: "groq", model: "llama" }], freeMode: true } });
+  const result = await planScenesWithFallback({
+    plan,
+    system: "s",
+    user: "u",
+    getKey: async () => "key",
+    isDisabled: () => false,
+    defaultClaudeModel: "claude",
+    fetchImpl: fakeFetch(
+      {
+        "generativelanguage.googleapis.com": { status: 404, body: GEMINI_404 },
+        "api.groq.com": { status: 200, body: { choices: [{ message: { content: "groq plan" } }] } },
+        "api.anthropic.com": { status: 200, body: { content: [{ type: "text", text: "must not be used" }] } },
+      },
+      calls,
+    ) as unknown as typeof fetch,
+  });
+  assert.deepEqual(result, { text: "groq plan", provider: "groq", model: "llama" });
+  assert.deepEqual(calls.map((u) => new URL(u).host), ["generativelanguage.googleapis.com", "api.groq.com"]);
+});
+
+test("when Gemini is the only free provider, generation stops with the exact model and provider error", async () => {
+  const calls: string[] = [];
+  const plan = resolveJobAiPlan({ ai: { providers: [{ id: "gemini", model: "models/gemini-2.5-pro" }], freeMode: true } });
+  await assert.rejects(
+    planScenesWithFallback({
+      plan,
+      system: "s",
+      user: "u",
+      getKey: async () => "key",
+      isDisabled: () => false,
+      defaultClaudeModel: "claude",
+      fetchImpl: fakeFetch({ "generativelanguage.googleapis.com": { status: 404, body: GEMINI_404 } }, calls) as unknown as typeof fetch,
+    }),
+    (err: Error) => {
+      assert.match(err.message, /Free Mode never falls back to paid providers/);
+      assert.match(err.message, /Google Gemini \(model gemini-2\.5-pro\): model not found or not available for this API key \(404\) — models\/gemini-2\.5-pro is not found for API version v1beta/);
+      assert.doesNotMatch(err.message, /AIza/);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, ["https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"]);
+});
+
+test("saved models are checked against the live model list (no hard-coded names)", () => {
+  const live = ["gemini-a", "models/gemini-b"];
+  assert.deepEqual(modelAvailability("gemini", "gemini-a", live), { ok: true, model: "gemini-a", message: null });
+  assert.equal(modelAvailability("gemini", "models/gemini-b", live).ok, true);
+  const missing = modelAvailability("gemini", "gemini-2.5-pro", live);
+  assert.equal(missing.ok, false);
+  assert.match(missing.message ?? "", /Google Gemini model "gemini-2\.5-pro" is not available for your API key/);
+  assert.equal(modelAvailability("groq", "llama", []).ok, false);
 });

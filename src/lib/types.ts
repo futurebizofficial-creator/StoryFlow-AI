@@ -92,6 +92,10 @@ export interface VideoJobRequest {
   textConfig?: SubtitleTextConfig;
   /** AVG music filename in the engine's input/bgm library. Absent means automatic music. */
   backgroundMusic?: string;
+  /** Production Setup: create a Gemini character reference. Absent on older jobs (= on). */
+  characterReference?: boolean;
+  /** When the user approved the Production Setup for this render (Studio renders). */
+  setupApprovedAt?: string;
   /** Scene-planning providers in fallback order. Absent on older jobs (Claude only). */
   ai?: {
     providers: Array<{ id: string; model: string | null }>;

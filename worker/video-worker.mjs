@@ -185,24 +185,36 @@ async function processJob(job) {
     // Reject invalid render or provider settings before spending any of the user's AI quota.
     buildEngineJobBody(job.request, "");
     const plan = resolveJobAiPlan(job.request);
-    const geminiKey = await providerKey(job, "gemini");
-    if (!geminiKey) throw new Error("Save your own Gemini API key in Integrations before rendering (it creates the character reference).");
+    // Production Setup: the character reference is optional (older jobs: on). Validate the stored
+    // value rather than trusting it, and only require a Gemini key when the step will run.
+    if (job.request.characterReference !== undefined && typeof job.request.characterReference !== "boolean") {
+      throw new Error("Invalid render settings: character reference must be true or false.");
+    }
+    const useReference = job.request.characterReference !== false;
+    const geminiKey = useReference ? await providerKey(job, "gemini") : null;
+    if (useReference && !geminiKey) {
+      throw new Error("Save your own Gemini API key in Integrations before rendering, or skip the character reference in Production Setup.");
+    }
     await update(job.id, { stage: "orchestrating", progress: 5 });
     const script = await createSceneScript(job, plan);
-    await update(job.id, { stage: "generating_character_reference", progress: 12 });
-    let reference;
-    try {
-      reference = await generateGeminiReference(job, geminiKey);
-    } catch (err) {
-      if (err?.status === 429 || err?.status === 402) {
-        throw new Error("Gemini quota exhausted while creating the character reference (" + err.status + "). Generation stopped; no other provider was used.");
+    let referencePath = null;
+    let visualBible = "";
+    if (useReference) {
+      await update(job.id, { stage: "generating_character_reference", progress: 12 });
+      let reference;
+      try {
+        reference = await generateGeminiReference(job, geminiKey);
+      } catch (err) {
+        if (err?.status === 429 || err?.status === 402) {
+          throw new Error("Gemini quota exhausted while creating the character reference (" + err.status + "). Generation stopped; no other provider was used.");
+        }
+        throw new Error(`Character reference (Google Gemini, model ${process.env.GEMINI_IMAGE_MODEL || "gemini-nano-banana-2.1"}) failed${err?.status ? ` (${err.status})` : ""}: ${err instanceof Error ? err.message : String(err)}`);
       }
-      throw err;
+      referencePath = `${job.workspace_id}/${job.id}/character-reference.${reference.mime === "image/jpeg" ? "jpg" : "png"}`;
+      const { error: referenceError } = await db.storage.from("storyflow-videos").upload(referencePath, reference.bytes, { contentType: reference.mime, upsert: true });
+      if (referenceError) throw referenceError;
+      visualBible = reference.description ? `## Consistent character reference\n${reference.description}\n\n` : "";
     }
-    const referencePath = `${job.workspace_id}/${job.id}/character-reference.${reference.mime === "image/jpeg" ? "jpg" : "png"}`;
-    const { error: referenceError } = await db.storage.from("storyflow-videos").upload(referencePath, reference.bytes, { contentType: reference.mime, upsert: true });
-    if (referenceError) throw referenceError;
-    const visualBible = reference.description ? `## Consistent character reference\n${reference.description}\n\n` : "";
     const renderScript = `${visualBible}${script}`.slice(0, 4900);
     const { mp4, thumbnail } = await startRender(job, renderScript);
     await update(job.id, { stage: "quality_check", progress: 92 });
