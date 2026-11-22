@@ -14,6 +14,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
     <AppShell
       workspaces={ctx.memberships.map((m) => ({ id: m.workspace.id, name: m.workspace.name, role: m.role }))}
       currentId={ctx.current.workspace.id}
+      canCreateWorkspace={ctx.memberships.some((m) => m.role === "owner")}
       user={{ name: ctx.profile?.full_name ?? "", email: ctx.user.email }}
     >
       {children}

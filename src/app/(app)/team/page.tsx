@@ -17,24 +17,25 @@ const ROLE_ORDER: Record<WorkspaceRole, number> = { owner: 0, admin: 1, member: 
 const PERMISSIONS: Array<{ label: string; roles: WorkspaceRole[] }> = [
   { label: "Create & edit projects and scripts", roles: ["owner", "admin", "member"] },
   { label: "Delete any project or script", roles: ["owner", "admin"] },
-  { label: "Invite members", roles: ["owner", "admin"] },
-  { label: "Invite admins & manage admin roles", roles: ["owner"] },
+  { label: "Invite members", roles: ["owner"] },
+  { label: "Change member and admin roles", roles: ["owner"] },
   { label: "Change integration settings", roles: ["owner", "admin"] },
   { label: "Rename workspace", roles: ["owner", "admin"] },
-  { label: "Delete workspace & manage owners", roles: ["owner"] },
+  { label: "Delete workspace", roles: ["owner"] },
 ];
 
 export default async function TeamPage() {
   const ctx = await getWorkspaceContext();
   const supabase = await createClient();
   const wsId = ctx.current.workspace.id;
+  const isOwner = ctx.role === "owner";
 
   const [{ data: membersData, error }, { data: invitesData }, origin] = await Promise.all([
     supabase
       .from("workspace_members")
       .select("user_id, role, created_at, profile:profiles(email, full_name, avatar_url)")
       .eq("workspace_id", wsId),
-    ctx.canManage
+    isOwner
       ? supabase
           .from("workspace_invitations")
           .select("id, email, role, token, status, expires_at, created_at")
@@ -51,12 +52,9 @@ export default async function TeamPage() {
   const invites = (invitesData ?? []) as Invitation[];
   const now = new Date();
 
-  /** Which roles the current user may assign to a target (mirrors DB rules). */
-  const assignable = (target: WorkspaceRole): WorkspaceRole[] | null => {
-    if (ctx.role === "owner") return ["owner", "admin", "member"];
-    if (ctx.role === "admin" && target !== "owner") return ["admin", "member"];
-    return null;
-  };
+  /** Which roles the current user may assign to a target (mirrors DB rules: owners only, never owner). */
+  const assignable = (target: WorkspaceRole): WorkspaceRole[] | null =>
+    isOwner && target !== "owner" ? ["admin", "member"] : null;
   const canRemove = (target: WorkspaceRole, self: boolean) =>
     self || ctx.role === "owner" || (ctx.role === "admin" && target === "member");
 
@@ -101,7 +99,7 @@ export default async function TeamPage() {
             )}
           </Card>
 
-          {ctx.canManage && (
+          {isOwner && (
             <Card>
               <CardHeader title="Pending invitations" description="Invite links expire after 7 days." />
               {invites.length === 0 ? (
@@ -135,20 +133,20 @@ export default async function TeamPage() {
         </div>
 
         <div className="space-y-6">
-          {ctx.canManage ? (
+          {isOwner ? (
             <Card>
-              <CardHeader title="Invite a teammate" />
+              <CardHeader title="Invite a teammate" description="Invitations are for Members only." />
               <div className="space-y-4 p-5">
-                <InviteForm canInviteAdmins={ctx.role === "owner"} />
+                <InviteForm />
                 <Alert tone="neutral">
-                  Invitations are delivered by link. Copy the link from the pending list and share it — the invitee
-                  also sees the invitation when they sign in with that email. Automated invite emails are not configured.
+                  StoryFlow is invite-only. Copy the link from the pending list and send it to the invitee — it is the
+                  only way to create a new account. Links expire after 7 days. Automated invite emails are not configured.
                 </Alert>
               </div>
             </Card>
           ) : (
             <Alert tone="neutral" title="Need to add someone?">
-              Ask a workspace owner or admin to send an invitation.
+              Only the workspace owner can send invitations.
             </Alert>
           )}
 

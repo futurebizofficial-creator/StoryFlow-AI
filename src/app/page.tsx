@@ -35,9 +35,6 @@ export default async function Home() {
               <Link href="/login" className="px-2 text-sm font-medium text-fg-2 hover:text-fg">
                 Sign in
               </Link>
-              <ButtonLink href="/signup" size="sm">
-                Get started
-              </ButtonLink>
             </>
           )}
         </nav>
@@ -57,15 +54,13 @@ export default async function Home() {
             StoryFlow AI brings projects, scripts and collaborators into one calm, secure workspace.
           </p>
           <div className="mt-9 flex flex-wrap justify-center gap-3">
-            <ButtonLink href={user ? "/dashboard" : "/signup"} size="lg">
-              {user ? "Go to dashboard" : "Create free workspace"} <Icon name="arrowRight" />
+            <ButtonLink href={user ? "/dashboard" : "/login"} size="lg">
+              {user ? "Go to dashboard" : "Sign in"} <Icon name="arrowRight" />
             </ButtonLink>
-            {!user && (
-              <ButtonLink href="/login" size="lg" variant="outline">
-                Sign in
-              </ButtonLink>
-            )}
           </div>
+          {!user && (
+            <p className="mt-4 text-sm text-muted">Access is by invitation. Ask your workspace owner for an invite link.</p>
+          )}
         </section>
 
         <section className="mx-auto max-w-5xl px-5 pb-24 sm:px-8">

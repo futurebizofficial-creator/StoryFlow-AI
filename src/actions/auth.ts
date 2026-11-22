@@ -4,7 +4,7 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { getOrigin } from "@/lib/origin";
-import { safeNextPath } from "@/lib/utils";
+import { isUuid, safeNextPath } from "@/lib/utils";
 import { WORKSPACE_COOKIE } from "@/lib/workspace";
 import type { ActionState } from "@/lib/types";
 
@@ -14,11 +14,21 @@ function readEmail(formData: FormData) {
   return String(formData.get("email") ?? "").trim().toLowerCase();
 }
 
+const INVITE_ONLY_ERROR =
+  "This invitation is invalid, has expired, or was sent to a different email address. Ask the workspace owner for a new invitation.";
+
+/**
+ * Invite-only signup. The token and email are checked here for a friendly error, and the
+ * database enforces the same rule on auth.users (enforce_invite_only_signup), so direct
+ * calls to Supabase Auth without a valid invitation fail as well.
+ */
 export async function signUpAction(_: ActionState, formData: FormData): Promise<ActionState> {
   const fullName = String(formData.get("fullName") ?? "").trim();
   const email = readEmail(formData);
   const password = String(formData.get("password") ?? "");
-  const next = safeNextPath(formData.get("next"), "/dashboard");
+  const token = String(formData.get("invitationToken") ?? "").trim();
+
+  if (!isUuid(token)) return { error: INVITE_ONLY_ERROR };
 
   const fieldErrors: Record<string, string> = {};
   if (fullName.length < 2) fieldErrors.fullName = "Enter your full name.";
@@ -27,17 +37,27 @@ export async function signUpAction(_: ActionState, formData: FormData): Promise<
   if (Object.keys(fieldErrors).length) return { fieldErrors };
 
   const supabase = await createClient();
+  const { data: valid, error: checkError } = await supabase.rpc("signup_invitation_is_valid", { _token: token, _email: email });
+  if (checkError) return { error: "We couldn't verify your invitation. Please try again." };
+  if (valid !== true) return { error: INVITE_ONLY_ERROR };
+
+  // After email confirmation the user lands on the invitation page to accept it.
+  const next = `/invite/${token}`;
   const origin = await getOrigin();
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
     options: {
-      data: { full_name: fullName },
+      data: { full_name: fullName, invitation_token: token },
       emailRedirectTo: `${origin}/auth/confirm?next=${encodeURIComponent(next)}`,
     },
   });
 
-  if (error) return { error: error.message };
+  if (error) {
+    // The database trigger rejects the insert if the invitation became invalid in the meantime.
+    if (/database error|invitation/i.test(error.message)) return { error: INVITE_ONLY_ERROR };
+    return { error: error.message };
+  }
 
   // Email confirmation disabled in Supabase → a session is returned immediately.
   if (data.session) redirect(next);

@@ -2,28 +2,21 @@
 
 import { useActionState, useState } from "react";
 import { inviteMemberAction, removeMemberAction, updateMemberRoleAction } from "@/actions/team";
-import { Field, Input, Select } from "@/components/ui";
+import { Field, Input } from "@/components/ui";
 import { FormMessage, SubmitButton } from "@/components/form";
 import { Icon } from "@/components/icons";
 import type { ActionState, WorkspaceRole } from "@/lib/types";
 
 const initial: ActionState = {};
 
-export function InviteForm({ canInviteAdmins }: { canInviteAdmins: boolean }) {
+/** Owner-only. Every invitation is a Member invitation (enforced by the database too). */
+export function InviteForm() {
   const [state, action] = useActionState(inviteMemberAction, initial);
   return (
     <form action={action} className="space-y-4">
-      <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_150px]">
-        <Field label="Email address" htmlFor="invite-email" error={state.fieldErrors?.email}>
-          <Input id="invite-email" name="email" type="email" placeholder="teammate@company.com" required />
-        </Field>
-        <Field label="Role" htmlFor="invite-role">
-          <Select id="invite-role" name="role" defaultValue="member">
-            <option value="member">Member</option>
-            {canInviteAdmins && <option value="admin">Admin</option>}
-          </Select>
-        </Field>
-      </div>
+      <Field label="Email address" htmlFor="invite-email" error={state.fieldErrors?.email} hint="They will join as a Member.">
+        <Input id="invite-email" name="email" type="email" placeholder="teammate@company.com" required />
+      </Field>
       <FormMessage state={state} />
       <SubmitButton pendingText="Inviting…">
         <Icon name="mail" /> Create invitation

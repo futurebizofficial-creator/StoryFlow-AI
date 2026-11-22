@@ -10,17 +10,14 @@ const ROLES: WorkspaceRole[] = ["owner", "admin", "member"];
 
 export async function inviteMemberAction(_: ActionState, formData: FormData): Promise<ActionState> {
   const ctx = await getWorkspaceContext();
-  if (!ctx.canManage) return { error: "Only owners and admins can invite teammates." };
+  // Invite-only access: only owners invite, and every invitation is a member invitation.
+  // The database enforces the same rules (invitations_insert_owners, member-only check).
+  if (ctx.role !== "owner") return { error: "Only the workspace owner can invite teammates." };
 
   const email = String(formData.get("email") ?? "").trim().toLowerCase();
-  const role = String(formData.get("role") ?? "member") as WorkspaceRole;
 
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
     return { fieldErrors: { email: "Enter a valid email address." } };
-  }
-  if (role !== "admin" && role !== "member") return { error: "Choose a valid role." };
-  if (role === "admin" && ctx.role !== "owner") {
-    return { error: "Only owners can invite admins." };
   }
   if (email === ctx.user.email.toLowerCase()) return { error: "You are already in this workspace." };
 
@@ -28,7 +25,7 @@ export async function inviteMemberAction(_: ActionState, formData: FormData): Pr
   const { error } = await supabase.from("workspace_invitations").insert({
     workspace_id: ctx.current.workspace.id,
     email,
-    role,
+    role: "member",
     invited_by: ctx.user.id,
   });
 
@@ -44,7 +41,7 @@ export async function inviteMemberAction(_: ActionState, formData: FormData): Pr
 export async function revokeInvitationAction(formData: FormData) {
   const ctx = await getWorkspaceContext();
   const id = formData.get("invitationId");
-  if (!ctx.canManage || !isUuid(id)) return;
+  if (ctx.role !== "owner" || !isUuid(id)) return;
 
   const supabase = await createClient();
   await supabase
@@ -63,6 +60,8 @@ export async function updateMemberRoleAction(
   const userId = formData.get("userId");
   const role = String(formData.get("role") ?? "") as WorkspaceRole;
   if (!isUuid(userId) || !ROLES.includes(role)) return { error: "Invalid request." };
+  if (ctx.role !== "owner") return { error: "Only owners can change roles." };
+  if (role === "owner") return { error: "The owner role cannot be granted." };
 
   const supabase = await createClient();
   const { error } = await supabase.rpc("update_member_role", {

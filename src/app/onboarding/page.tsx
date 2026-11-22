@@ -28,7 +28,13 @@ export default async function OnboardingPage({ searchParams }: { searchParams: P
   if (memberships.length > 0 && !creatingAnother) redirect("/dashboard");
 
   const supabase = await createClient();
-  const { data } = await supabase.rpc("my_pending_invitations");
+  // Invite-only: only the platform owner may create workspaces (enforced by create_workspace()).
+  const [{ data }, { data: ownerCheck }] = await Promise.all([
+    supabase.rpc("my_pending_invitations"),
+    supabase.rpc("is_platform_owner"),
+  ]);
+  const canCreate = ownerCheck === true;
+  if (creatingAnother && !canCreate && memberships.length > 0) redirect("/dashboard");
   const invites = (data ?? []) as Array<{ token: string; workspace_name: string; role: WorkspaceRole; invited_by_name: string | null }>;
 
   return (
@@ -51,13 +57,15 @@ export default async function OnboardingPage({ searchParams }: { searchParams: P
 
       <main className="mx-auto max-w-md px-4 pt-8 pb-16 sm:pt-16">
         <p className="text-xs font-medium tracking-wide text-accent uppercase">
-          {memberships.length ? "New workspace" : "Welcome to StoryFlow"}
+          {memberships.length && canCreate ? "New workspace" : "Welcome to StoryFlow"}
         </p>
         <h1 className="mt-2 text-[28px] font-semibold tracking-tight">
-          {memberships.length ? "Create another workspace" : "Set up your workspace"}
+          {!canCreate ? "Join your workspace" : memberships.length ? "Create another workspace" : "Set up your workspace"}
         </h1>
         <p className="mt-2 text-sm text-muted">
-          Workspaces keep projects, scripts and teammates separate. You&apos;ll be the owner.
+          {canCreate
+            ? "Workspaces keep projects, scripts and teammates separate. You'll be the owner."
+            : "StoryFlow is invite-only. Accept your invitation below to join the workspace."}
           <span className="block pt-1 text-xs">Signed in as {user.email}</span>
         </p>
 
@@ -83,13 +91,22 @@ export default async function OnboardingPage({ searchParams }: { searchParams: P
                 </form>
               </Card>
             ))}
-            <p className="pt-3 text-center text-xs text-muted">or create your own</p>
+            {canCreate && <p className="pt-3 text-center text-xs text-muted">or create your own</p>}
           </div>
         )}
 
-        <Card className="mt-6 p-6">
-          <CreateWorkspaceForm />
-        </Card>
+        {canCreate ? (
+          <Card className="mt-6 p-6">
+            <CreateWorkspaceForm />
+          </Card>
+        ) : (
+          invites.length === 0 && (
+            <Card className="mt-7 p-6 text-sm text-muted">
+              You don&apos;t have a pending invitation for {user.email}. Ask the workspace owner to invite this address,
+              then open the invitation link.
+            </Card>
+          )
+        )}
       </main>
     </div>
   );

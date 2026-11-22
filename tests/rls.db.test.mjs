@@ -6,7 +6,9 @@ import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 
 const dir = fileURLToPath(new URL("../supabase/migrations/", import.meta.url));
-const migration = readdirSync(dir).filter((f) => f.endsWith(".sql")).sort().map((f) => readFileSync(join(dir, f), "utf8")).join("\n");
+// Foundation + video migrations. The invite-only migration (20261123…) changes owner/admin
+// rules and is covered, on top of seeded data, by tests/invite-only.db.test.mjs.
+const migration = readdirSync(dir).filter((f) => f.endsWith(".sql") && f < "20261123").sort().map((f) => readFileSync(join(dir, f), "utf8")).join("\n");
 const db = new PGlite();
 
 await db.exec(`

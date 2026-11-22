@@ -68,15 +68,15 @@ export function LoginForm({ next }: { next: string }) {
   );
 }
 
-export function SignupForm({ next }: { next: string }) {
+export function SignupForm({ invitationToken }: { invitationToken: string }) {
   const [state, action] = useActionState(signUpAction, initial);
   return (
     <form action={action} className="space-y-4">
-      <input type="hidden" name="next" value={next} />
+      <input type="hidden" name="invitationToken" value={invitationToken} />
       <Field label="Full name" htmlFor="fullName" error={state.fieldErrors?.fullName}>
         <Input id="fullName" name="fullName" autoComplete="name" placeholder="Ada Lovelace" required />
       </Field>
-      <Field label="Work email" htmlFor="email" error={state.fieldErrors?.email}>
+      <Field label="Invited email" htmlFor="email" error={state.fieldErrors?.email} hint="Must match the address your invitation was sent to.">
         <Input id="email" name="email" type="email" autoComplete="email" placeholder="you@company.com" required />
       </Field>
       <Field label="Password" htmlFor="password" error={state.fieldErrors?.password} hint="At least 8 characters.">

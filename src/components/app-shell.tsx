@@ -21,6 +21,8 @@ interface ShellProps {
   workspaces: ShellWorkspace[];
   currentId: string;
   user: { name: string; email: string };
+  /** Only owners can create workspaces (invite-only; enforced by create_workspace()). */
+  canCreateWorkspace?: boolean;
   children: ReactNode;
 }
 
@@ -50,7 +52,15 @@ function isActive(pathname: string, href: string) {
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 
-function WorkspaceSwitcher({ workspaces, currentId }: { workspaces: ShellWorkspace[]; currentId: string }) {
+function WorkspaceSwitcher({
+  workspaces,
+  currentId,
+  canCreateWorkspace,
+}: {
+  workspaces: ShellWorkspace[];
+  currentId: string;
+  canCreateWorkspace?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const current = workspaces.find((w) => w.id === currentId) ?? workspaces[0];
@@ -118,6 +128,7 @@ function WorkspaceSwitcher({ workspaces, currentId }: { workspaces: ShellWorkspa
               </form>
             ))}
           </div>
+          {canCreateWorkspace && (
           <div className="mt-1 border-t border-border pt-1">
             <Link
               href="/onboarding?new=1"
@@ -128,13 +139,14 @@ function WorkspaceSwitcher({ workspaces, currentId }: { workspaces: ShellWorkspa
               <Icon name="plus" size={14} /> Create workspace
             </Link>
           </div>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-function SidebarContent({ workspaces, currentId, user, onNavigate }: Omit<ShellProps, "children"> & { onNavigate?: () => void }) {
+function SidebarContent({ workspaces, currentId, user, canCreateWorkspace, onNavigate }: Omit<ShellProps, "children"> & { onNavigate?: () => void }) {
   const pathname = usePathname();
   return (
     <div className="flex h-full flex-col">
@@ -144,7 +156,7 @@ function SidebarContent({ workspaces, currentId, user, onNavigate }: Omit<ShellP
         </Link>
       </div>
       <div className="px-3">
-        <WorkspaceSwitcher workspaces={workspaces} currentId={currentId} />
+        <WorkspaceSwitcher workspaces={workspaces} currentId={currentId} canCreateWorkspace={canCreateWorkspace} />
       </div>
 
       <nav className="mt-5 flex-1 space-y-6 overflow-y-auto px-3" aria-label="Main">

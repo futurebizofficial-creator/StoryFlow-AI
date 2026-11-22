@@ -1,4 +1,3 @@
-import Link from "next/link";
 import type { Metadata } from "next";
 import { LoginForm } from "@/components/auth-forms";
 import { Alert } from "@/components/ui";
@@ -27,13 +26,7 @@ export default async function LoginPage({
         <LoginForm next={nextPath} />
       </div>
       <p className="mt-6 text-center text-sm text-muted">
-        New to StoryFlow?{" "}
-        <Link
-          href={nextPath !== "/dashboard" ? `/signup?next=${encodeURIComponent(nextPath)}` : "/signup"}
-          className="font-medium text-accent hover:underline"
-        >
-          Create an account
-        </Link>
+        StoryFlow is invite-only. New accounts are created from an invitation link sent by a workspace owner.
       </p>
     </div>
   );

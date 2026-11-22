@@ -70,7 +70,7 @@ export default async function InvitePage({
                 <ButtonLink href={`/login?next=${encodeURIComponent(next)}`} variant="outline">
                   Sign in
                 </ButtonLink>
-                <ButtonLink href={`/signup?next=${encodeURIComponent(next)}`}>Create account</ButtonLink>
+                <ButtonLink href={`/signup?invite=${encodeURIComponent(token)}`}>Create account</ButtonLink>
               </div>
             </>
           ) : !invitation ? (
@@ -96,7 +96,7 @@ export default async function InvitePage({
                   <Alert tone="warning">This invitation has already been {invitation.status}.</Alert>
                 )}
                 {expired && invitation.status === "pending" && (
-                  <Alert tone="warning">This invitation has expired. Ask an admin to send a new one.</Alert>
+                  <Alert tone="warning">This invitation has expired. Ask the workspace owner to send a new one.</Alert>
                 )}
                 {emailMismatch && (
                   <Alert tone="warning">
